@@ -120,6 +120,7 @@ async fn main() {
         sync_tx: Some(sync_tx),
         rev_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         cap_cache: Arc::new(bunnymeshdb::ns::CapCache::new()),
+        token_cache: Arc::new(bunnymeshdb::caps::TokenCache::new()),
     };
 
     // L3-as-filesystem (M4): mount in a background thread when requested.

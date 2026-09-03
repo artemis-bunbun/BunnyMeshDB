@@ -8,6 +8,7 @@ use crate::core::ident::{Keypair, PublicKey};
 use crate::util::{b64url_decode, b64url_encode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -575,4 +576,43 @@ mod tests {
         assert!(Capability::from_json("{}").is_err());
         assert!(Capability::from_json("{\"bogus\":1}").is_err());
     }
+}
+
+/// Content-addressed parse cache: sha256(token bytes) → parsed capability.
+/// Same bytes always parse identically, so reusing the cached parse is
+/// exactly equivalent to re-parsing — no security property depends on the
+/// parse itself (verification still runs per request).
+pub struct TokenCache {
+    shards: [parking_lot::Mutex<std::collections::HashMap<[u8; 32], Arc<Capability>>>; 256],
+}
+
+impl TokenCache {
+    pub fn new() -> Self {
+        let shards = std::array::from_fn(|_| parking_lot::Mutex::new(std::collections::HashMap::new()));
+        TokenCache { shards }
+    }
+
+    /// Lock-free-ish read (try_lock); miss returns None so the caller parses.
+    pub fn get(&self, digest: &[u8; 32]) -> Option<Arc<Capability>> {
+        let shard = (digest[0] as usize) % 256;
+        self.shards[shard].try_lock().and_then(|m| m.get(digest).cloned())
+    }
+
+    /// Insert a parsed capability, bounded per shard (clear on overflow).
+    pub fn put(&self, digest: [u8; 32], cap: Arc<Capability>) {
+        let shard = (digest[0] as usize) % 256;
+        let mut m = self.shards[shard].lock();
+        if m.len() >= 4096 {
+            m.clear();
+        }
+        m.insert(digest, cap);
+    }
+}
+
+/// sha256 of the full `bmdb-cap:...` token bytes (cheap, collision-safe key).
+pub fn token_digest(token: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    h.finalize().into()
 }

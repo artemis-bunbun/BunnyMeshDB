@@ -2,7 +2,7 @@
 
 pub mod config;
 
-use crate::caps::{Capability, PermSet, RevocationSet, Scope, Tier};
+use crate::caps::{Capability, PermSet, RevocationSet, Scope, Tier, TokenCache};
 use crate::core::hlc::Hlc;
 use crate::core::ident::{Keypair, PublicKey};
 use crate::ns::{account_write, authorize_cached, ensure_l3_namespace, CapCache};
@@ -38,6 +38,8 @@ pub struct AppState {
     pub rev_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// cap nonce → epoch it was fully verified in (bounded; see ns.rs).
     pub cap_cache: Arc<CapCache>,
+    /// token digest → parsed capability (content-addressed parse cache).
+    pub token_cache: Arc<TokenCache>,
 }
 
 impl AppState {
@@ -75,7 +77,7 @@ fn auth_to_response(e: crate::ns::AuthError) -> Response {
 /// - Header present but unparseable → 401.
 /// - Valid → Some(caps).
 pub async fn auth_mw(
-    _state: State<AppState>,
+    state: State<AppState>,
     headers: HeaderMap,
     req: axum::extract::Request,
     next: Next,
@@ -87,14 +89,31 @@ pub async fn auth_mw(
             req.extensions_mut().insert(None::<AuthCaps>);
             next.run(req).await
         }
-        Some(h) => match parse_cap_header(h) {
-            Ok(cap) => {
-                let mut req = req;
-                req.extensions_mut().insert(Some(AuthCaps(vec![cap])));
-                next.run(req).await
+        Some(h) => {
+            // Parse cache: sha256 digest → parsed capability. Content-addressed,
+            // so a hit is byte-identical to re-parsing; per-request verification
+            // (sig, expiry, revocation) still runs in the authorize path.
+            let digest = crate::caps::token_digest(h);
+            let cap = match state.token_cache.get(&digest) {
+                Some(arc) => Ok((*arc).clone()),
+                None => match parse_cap_header(h) {
+                    Ok(cap) => {
+                        let arc = std::sync::Arc::new(cap);
+                        state.token_cache.put(digest, arc.clone());
+                        Ok((*arc).clone())
+                    }
+                    Err(e) => Err(e),
+                },
+            };
+            match cap {
+                Ok(cap) => {
+                    let mut req = req;
+                    req.extensions_mut().insert(Some(AuthCaps(vec![cap])));
+                    next.run(req).await
+                }
+                Err(_) => err_json(StatusCode::UNAUTHORIZED, "invalid_capability"),
             }
-            Err(_) => err_json(StatusCode::UNAUTHORIZED, "invalid_capability"),
-        },
+        }
     }
 }
 
