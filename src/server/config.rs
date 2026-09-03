@@ -20,6 +20,9 @@ pub struct Node {
     pub data_dir: String,
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// libp2p listen port (mesh sync).
+    #[serde(default = "default_p2p_listen")]
+    pub p2p_listen: String,
     #[serde(default)]
     pub l3: L3,
 }
@@ -46,6 +49,7 @@ impl Default for Config {
                 name: default_name(),
                 data_dir: default_data_dir(),
                 listen: default_listen(),
+                p2p_listen: default_p2p_listen(),
                 l3: L3 { default_quota: default_quota() },
             },
             peers: Vec::new(),
@@ -59,6 +63,7 @@ impl Default for Node {
             name: default_name(),
             data_dir: default_data_dir(),
             listen: default_listen(),
+            p2p_listen: default_p2p_listen(),
             l3: L3 { default_quota: default_quota() },
         }
     }
@@ -78,6 +83,9 @@ fn default_data_dir() -> String {
 }
 fn default_listen() -> String {
     "127.0.0.1:8848".to_string()
+}
+fn default_p2p_listen() -> String {
+    "9002".to_string()
 }
 fn default_quota() -> u64 {
     1073741824 // 1 GiB

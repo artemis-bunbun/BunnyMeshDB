@@ -24,6 +24,17 @@ enum Commands {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// List mesh peers (name, addr, TOFU pin) from the server config.
+    Peers {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Clear a peer's TOFU pin (re-pins on next successful Hello).
+    Untrust {
+        #[arg(long)]
+        config: PathBuf,
+        name: String,
+    },
 }
 
 fn main() {
@@ -33,6 +44,49 @@ fn main() {
             let data = dir.join("data");
             match meta::init(&data) {
                 Ok(kp) => println!("node key: {}", kp.public()),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Peers { config } => {
+            match bunnymeshdb::server::config::Config::load(&config) {
+                Ok(cfg) => {
+                    if cfg.peers.is_empty() {
+                        println!("(no peers configured)");
+                    }
+                    for p in &cfg.peers {
+                        let pin = if p.pin.is_empty() { "(none)" } else { &p.pin };
+                        println!("{}  {}  pin={}", p.name, p.addr, pin);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Untrust { config, name } => {
+            match bunnymeshdb::server::config::Config::load(&config) {
+                Ok(mut cfg) => {
+                    match cfg.peer_mut(&name) {
+                        Some(p) => {
+                            p.pin.clear();
+                            match cfg.save(&config) {
+                                Ok(()) => println!("cleared pin for {name}"),
+                                Err(e) => {
+                                    eprintln!("error: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        }
+                        None => {
+                            eprintln!("error: no peer named {name:?}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 Err(e) => {
                     eprintln!("error: {e}");
                     std::process::exit(1);

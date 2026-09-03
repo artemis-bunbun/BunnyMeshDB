@@ -494,6 +494,8 @@ impl Store {
         let seq = log.append(&bytes)?;
         let version = Version { hlc, replica, author, value: value.to_vec(), seq };
         let entry_key = (ns.to_string(), key.clone());
+        // A local write is new user intent: it resurrects the key.
+        self.tombs.remove(&entry_key);
         match policy {
             ConflictPolicy::Lww => {
                 self.index.insert(entry_key, Entry::Lww(version));
@@ -677,7 +679,17 @@ impl Store {
                 };
                 match policy {
                     ConflictPolicy::Lww => {
-                        self.index.insert(entry_key, Entry::Lww(version));
+                        // Keep max (hlc, replica): out-of-order arrival must
+                        // never regress the visible value.
+                        let newer = match self.index.get(&entry_key) {
+                            Some(Entry::Lww(v)) => {
+                                (version.hlc, version.replica) >= (v.hlc, v.replica)
+                            }
+                            _ => true,
+                        };
+                        if newer {
+                            self.index.insert(entry_key, Entry::Lww(version));
+                        }
                     }
                     ConflictPolicy::CrdtRegister => match self.index.get_mut(&entry_key) {
                         Some(Entry::Register(vs)) => vs.push(version),
@@ -705,6 +717,80 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// Version identity of a record for dedupe: (tag, hlc, replica).
+    /// Two records with the same originating event (hlc, replica) are the
+    /// same write, regardless of arrival order.
+    fn version_key(r: &Record) -> (u8, u64, [u8; 32]) {
+        (r.tag, r.hlc, r.replica)
+    }
+
+    /// The set of versions already in the namespace log (the authoritative
+    /// version history — the live index trims LWW history, so dedupe must
+    /// read the log, which never trims).
+    fn log_versions(&self, ns: &str) -> Result<std::collections::BTreeSet<(u8, u64, [u8; 32])>, StorageError> {
+        let mut seen = std::collections::BTreeSet::new();
+        if let Some(log) = self.logs.get(ns) {
+            let recs = log.read_records(1, 0)?;
+            for (_, bytes) in recs {
+                if let Ok((record, _)) = Record::parse_chain(&bytes, None) {
+                    seen.insert(Self::version_key(&record));
+                }
+            }
+        }
+        Ok(seen)
+    }
+
+    /// Apply one verified sync record; the log is the dedupe authority.
+    /// Returns `true` if appended, `false` for a duplicate.
+    pub fn apply_synced(&mut self, ns: &str, record: &Record) -> Result<bool, StorageError> {
+        self.policies
+            .get(ns)
+            .ok_or_else(|| StorageError::BadName(ns.to_string()))?;
+        let key = Self::version_key(record);
+        if self.log_versions(ns)?.contains(&key) {
+            return Ok(false);
+        }
+        let seq = {
+            let log = self
+                .logs
+                .get_mut(ns)
+                .ok_or_else(|| StorageError::NotFound(ns.to_string()))?;
+            let bytes = record.to_bytes(log.head());
+            log.append(&bytes)?
+        };
+        self.apply_record(ns, record, seq)?;
+        self.revision += 1;
+        Ok(true)
+    }
+
+    /// Apply a verified batch, scanning the log version-set once.
+    /// Returns the number of newly-applied records.
+    pub fn apply_synced_batch(&mut self, ns: &str, records: &[Record]) -> Result<u64, StorageError> {
+        self.policies
+            .get(ns)
+            .ok_or_else(|| StorageError::BadName(ns.to_string()))?;
+        let mut seen = self.log_versions(ns)?;
+        let mut applied = 0u64;
+        for record in records {
+            let key = Self::version_key(record);
+            if !seen.insert(key) {
+                continue; // duplicate
+            }
+            let seq = {
+                let log = self
+                    .logs
+                    .get_mut(ns)
+                    .ok_or_else(|| StorageError::NotFound(ns.to_string()))?;
+                let bytes = record.to_bytes(log.head());
+                log.append(&bytes)?
+            };
+            self.apply_record(ns, record, seq)?;
+            applied += 1;
+            self.revision += 1;
+        }
+        Ok(applied)
     }
 
     pub fn meta_get(&self, key: &str) -> Option<&[u8]> {

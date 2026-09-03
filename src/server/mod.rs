@@ -31,6 +31,16 @@ pub struct AppState {
     pub revocations: Arc<PLRwLock<RevocationSet>>,
     pub host_name: String,
     pub default_quota: u64,
+    /// Mesh sync trigger: fired immediately after writes commit.
+    pub sync_tx: Option<tokio::sync::mpsc::Sender<()>>,
+}
+
+impl AppState {
+    fn notify_sync(&self) {
+        if let Some(tx) = &self.sync_tx {
+            let _ = tx.try_send(());
+        }
+    }
 }
 
 /// Capabilities attached by the auth middleware (Some for L1/L2 bearer caps,
@@ -468,7 +478,11 @@ fn handle_data(
             let hlc = Hlc::now().to_u64();
             let rid = state.root.to_bytes();
             match store.put(ns, &k, body, hlc, rid, principal.to_bytes()) {
-                Ok(seq) => Json(json!({ "ok": true, "seq": seq })).into_response(),
+                Ok(seq) => {
+                    drop(store);
+                    state.notify_sync();
+                    Json(json!({ "ok": true, "seq": seq })).into_response()
+                }
                 Err(e) => {
                     tracing::error!(%e, "put");
                     err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal")
@@ -483,7 +497,11 @@ fn handle_data(
             let hlc = Hlc::now().to_u64();
             let rid = state.root.to_bytes();
             match store.delete(ns, &k, hlc, rid, principal.to_bytes()) {
-                Ok(_) => Json(json!({ "ok": true })).into_response(),
+                Ok(_) => {
+                    drop(store);
+                    state.notify_sync();
+                    Json(json!({ "ok": true })).into_response()
+                }
                 Err(e) => {
                     tracing::error!(%e, "delete");
                     err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal")

@@ -92,9 +92,12 @@ fn exec(ctx: &mut QueryCtx, call: &Call) -> Result<Value, QueryError> {
         }
         "clock_skew" => {
             argc(call, 1)?;
-            // M1: no sync data yet — always Null. M3 returns a real estimate.
-            let _host = str_arg(ctx, &call.args[0])?;
-            Ok(Value::Null)
+            let host = str_arg(ctx, &call.args[0])?;
+            // M3: peer-clock estimate from sync; Null before any Hello sample.
+            match ctx.store.peer_clock(&host) {
+                Some(diff) => Ok(Value::Num(diff as u64)),
+                None => Ok(Value::Null),
+            }
         }
         "use" => {
             argc(call, 1)?;
@@ -160,6 +163,29 @@ fn exec(ctx: &mut QueryCtx, call: &Call) -> Result<Value, QueryError> {
                 ));
             }
             Ok(Value::List(out))
+        }
+        "get_all" => {
+            argc(call, 1)?;
+            let ns = scope(ctx)?;
+            let key = str_arg(ctx, &call.args[0])?.into_bytes();
+            match ctx.store.get(&ns, &key) {
+                // Tombstoned → empty view.
+                None => Ok(Value::Null),
+                Some(Entry::Lww(v)) => Ok(Value::List(vec![
+                    Value::Str(hex::encode(v.replica)),
+                    Value::Num(v.hlc),
+                    Value::Str(String::from_utf8_lossy(&v.value).into_owned()),
+                ])),
+                Some(Entry::Register(vs)) => {
+                    let mut out = Vec::with_capacity(vs.len() * 3);
+                    for v in vs {
+                        out.push(Value::Str(hex::encode(v.replica)));
+                        out.push(Value::Num(v.hlc));
+                        out.push(Value::Str(String::from_utf8_lossy(&v.value).into_owned()));
+                    }
+                    Ok(Value::List(out))
+                }
+            }
         }
         other => Err(QueryError::UnknownFn(other.to_string())),
     }

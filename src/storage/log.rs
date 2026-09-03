@@ -80,6 +80,17 @@ impl Record {
     /// Parse a full record; verifies declared lengths, chain adjacency
     /// against `expected_prev` (the running head), and CRC.
     pub fn parse(bytes: &[u8], expected_prev: &[u8; 32]) -> Result<(Record, [u8; 32]), StorageError> {
+        Self::parse_chain_impl(bytes, Some(expected_prev))
+    }
+
+    /// Parse with optional chain cross-check: `None` skips the adjacency
+    /// check (used for sync batches whose first record chains into the
+    /// peer's own history). CRC/tag/lengths are always verified.
+    pub fn parse_chain(bytes: &[u8], expected_prev: Option<&[u8; 32]>) -> Result<(Record, [u8; 32]), StorageError> {
+        Self::parse_chain_impl(bytes, expected_prev)
+    }
+
+    fn parse_chain_impl(bytes: &[u8], expected_prev: Option<&[u8; 32]>) -> Result<(Record, [u8; 32]), StorageError> {
         if bytes.len() < HEADER_LEN {
             return Err(StorageError::Corrupt { ns: None, detail: "record shorter than header".into() });
         }
@@ -101,11 +112,13 @@ impl Record {
             return Err(StorageError::Corrupt { ns: None, detail: "crc32 mismatch".into() });
         }
         let prev: [u8; 32] = bytes[9..41].try_into().unwrap();
-        if &prev != expected_prev {
-            return Err(StorageError::Corrupt {
-                ns: None,
-                detail: "chain adjacency violated (prev != running head)".into(),
-            });
+        if let Some(exp) = expected_prev {
+            if &prev != exp {
+                return Err(StorageError::Corrupt {
+                    ns: None,
+                    detail: "chain adjacency violated (prev != running head)".into(),
+                });
+            }
         }
         let mut p = HEADER_LEN;
         let key_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
@@ -360,9 +373,10 @@ impl Log {
             self.cur_len = 0;
             self.seg_lens.push((self.cur_seg, 0));
         }
-        // Logical offset = sum of settled segment lengths + position within
-        // the live segment (which seg_lens tracks as its last entry).
-        let off = self.seg_lens.iter().map(|(_, l)| *l).sum::<u64>() - self.cur_len;
+        // Logical offset of the record = total bytes already written across
+        // all segments (seg_lens tracks the live segment's length as its
+        // last entry, so the sum is the current file end).
+        let off = self.seg_lens.iter().map(|(_, l)| *l).sum::<u64>();
         self.cur.write_all(bytes)?;
         self.cur_len += bytes.len() as u64;
         if let Some(last) = self.seg_lens.last_mut() {

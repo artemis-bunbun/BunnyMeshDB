@@ -95,13 +95,26 @@ async fn main() {
     tracing::info!(host = %cfg.node.name, listen = %cfg.node.listen, "serving");
     tracing::info!("admin cap: {admin_cap}");
 
+    // --- mesh sync (M3) ---
+    let (sync_tx, sync_rx) = tokio::sync::mpsc::channel::<()>(64);
+    let store_arc: Arc<Mutex<bunnymeshdb::storage::Store>> = Arc::new(Mutex::new(store));
+    let sync_cfg = Arc::new(Mutex::new(cfg.clone()));
+    let engine = bunnymeshdb::net::SyncEngine::new(
+        store_arc.clone(),
+        kp.clone(),
+        sync_cfg,
+        config_path,
+    );
+    let sync_task = tokio::spawn(engine.run(sync_rx, 30));
+
     let state = AppState {
-        store: Arc::new(Mutex::new(store)),
+        store: store_arc,
         root,
         kp: Arc::new(kp),
         revocations: Arc::new(RwLock::new(revocations)),
         host_name: cfg.node.name.clone(),
         default_quota: cfg.node.l3.default_quota,
+        sync_tx: Some(sync_tx),
     };
 
     // Periodic checkpoint every 60 s.
@@ -128,6 +141,7 @@ async fn main() {
         .await
         .expect("serve failed");
     ckpt_task.abort();
+    sync_task.abort();
     tracing::info!("bye");
 }
 
