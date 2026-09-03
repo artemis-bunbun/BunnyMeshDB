@@ -31,8 +31,7 @@ enum Cmd {
     },
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
@@ -48,6 +47,25 @@ async fn main() {
         }
     };
 
+    // Build the runtime by hand so the worker count comes from config (and
+    // defaults to a light 4 instead of one per core).
+    let n_workers = cfg.node.worker_threads.max(1);
+    tracing::info!(worker_threads = n_workers, "starting daemon runtime");
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(n_workers)
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("fatal: build runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    rt.block_on(run(config_path, mount_at, cfg));
+}
+
+async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
     let kp = match meta::load(std::path::Path::new(&cfg.node.data_dir)) {
         Ok(kp) => kp,
         Err(e) => {
@@ -99,16 +117,29 @@ async fn main() {
     tracing::info!("admin cap: {admin_cap}");
 
     // --- mesh sync (M3) ---
-    let (sync_tx, sync_rx) = tokio::sync::mpsc::channel::<()>(64);
+    // Optional: a daemon with mesh_sync=false skips the whole libp2p swarm
+    // (noise/yamux/request-response allocations) — a lightweight API-only
+    // node. Other mesh nodes can still pull from its log via their own
+    // engines; this node just never dials or listens on p2p.
     let store_arc: Arc<RwLock<bunnymeshdb::storage::Store>> = Arc::new(RwLock::new(store));
-    let sync_cfg = Arc::new(Mutex::new(cfg.clone()));
-    let engine = bunnymeshdb::net::SyncEngine::new(
-        store_arc.clone(),
-        kp.clone(),
-        sync_cfg,
-        config_path,
-    );
-    let sync_task = tokio::spawn(engine.run(sync_rx, 30));
+    let (sync_tx, sync_task);
+    if cfg.node.mesh_sync {
+        let (tx, rx) = tokio::sync::mpsc::channel::<()>(64);
+        let sync_cfg = Arc::new(Mutex::new(cfg.clone()));
+        let engine = bunnymeshdb::net::SyncEngine::new(
+            store_arc.clone(),
+            kp.clone(),
+            sync_cfg,
+            config_path,
+        );
+        let task = tokio::spawn(engine.run(rx, 30));
+        sync_tx = Some(tx);
+        sync_task = Some(task);
+    } else {
+        tracing::info!("mesh sync disabled (mesh_sync=false) — API-only daemon");
+        sync_tx = None;
+        sync_task = None;
+    }
 
     let state = AppState {
         store: store_arc,
@@ -117,7 +148,7 @@ async fn main() {
         revocations: Arc::new(RwLock::new(revocations)),
         host_name: cfg.node.name.clone(),
         default_quota: cfg.node.l3.default_quota,
-        sync_tx: Some(sync_tx),
+        sync_tx,
         rev_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         cap_cache: Arc::new(bunnymeshdb::ns::CapCache::new()),
         token_cache: Arc::new(bunnymeshdb::caps::TokenCache::new()),
@@ -178,7 +209,9 @@ async fn main() {
         .await
         .expect("serve failed");
     ckpt_task.abort();
-    sync_task.abort();
+    if let Some(t) = sync_task {
+        t.abort();
+    }
     tracing::info!("bye");
 }
 

@@ -23,6 +23,16 @@ pub struct Node {
     /// libp2p listen port (mesh sync).
     #[serde(default = "default_p2p_listen")]
     pub p2p_listen: String,
+    /// Tokio worker threads for the daemon runtime (default 4 — the mesh
+    /// workload rarely needs more; raise for single-node write throughput).
+    #[serde(default = "default_workers")]
+    pub worker_threads: usize,
+    /// Build the libp2p mesh-sync engine (default true). Set false for a
+    /// lightweight API-only daemon (no swarm/noise allocations — RSS drops
+    /// ~60-80 MB); replication is then served by other nodes pulling from
+    /// this node's log.
+    #[serde(default = "default_mesh_sync")]
+    pub mesh_sync: bool,
     #[serde(default)]
     pub l3: L3,
 }
@@ -50,6 +60,8 @@ impl Default for Config {
                 data_dir: default_data_dir(),
                 listen: default_listen(),
                 p2p_listen: default_p2p_listen(),
+                worker_threads: default_workers(),
+                mesh_sync: default_mesh_sync(),
                 l3: L3 { default_quota: default_quota() },
             },
             peers: Vec::new(),
@@ -64,6 +76,8 @@ impl Default for Node {
             data_dir: default_data_dir(),
             listen: default_listen(),
             p2p_listen: default_p2p_listen(),
+            worker_threads: default_workers(),
+            mesh_sync: default_mesh_sync(),
             l3: L3 { default_quota: default_quota() },
         }
     }
@@ -80,6 +94,12 @@ fn default_name() -> String {
 }
 fn default_data_dir() -> String {
     "./data".to_string()
+}
+fn default_workers() -> usize {
+    4
+}
+fn default_mesh_sync() -> bool {
+    true
 }
 fn default_listen() -> String {
     "127.0.0.1:8848".to_string()
