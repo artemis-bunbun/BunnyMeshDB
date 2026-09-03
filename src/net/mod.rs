@@ -253,6 +253,7 @@ struct Runner {
 impl Runner {
     /// (Re)start a sync round for every configured peer not mid-flight.
     fn kick_all(&mut self) {
+        tracing::info!("kick_all: {} peers", self.peer.keys().count());
         self.round_applied = 0;
         let peers: Vec<(String, String)> = {
             let cfg = self.engine.cfg.lock();
@@ -294,6 +295,7 @@ impl Runner {
 
     /// Advance one peer's round: ensure a connection, then send Hello.
     fn kick(&mut self, name: String) {
+        tracing::info!("kick {name} phase={:?}", self.peer.get(&name).map(|c| c.phase.clone()));
         let phase = { self.peer.get(&name).map(|c| c.phase.clone()).unwrap_or(Phase::Idle) };
         if matches!(phase, Phase::AwaitingHello | Phase::Pulling { .. } | Phase::WaitingDial) {
             return;
@@ -316,9 +318,9 @@ impl Runner {
             }
             None => {
                 let key = addr_key(&addr);
-                if self.pending_dials.contains_key(&key) {
-                    return; // dial already in flight
-                }
+                // A stale pending entry (previous dial failed before any
+                // ConnectionEstablished) must never block a retry.
+                self.pending_dials.remove(&key);
                 match self.swarm.dial(addr.clone()) {
                     Ok(()) => {
                         self.pending_dials.insert(key, name.clone());
@@ -407,6 +409,7 @@ impl Runner {
                 }
             }
         }
+        tracing::info!(peer = %name, pulls = ?pulls.iter().map(|(n,s)| format!("{n}@{s}")).collect::<Vec<_>>(), "hello processed");
         if pulls.is_empty() {
             self.phase_set(&name, Phase::Done);
             return;
@@ -422,6 +425,7 @@ impl Runner {
             let store = self.engine.store.lock();
             store.head(&ns).map(|(s, _)| s + 1).unwrap_or(1)
         };
+        tracing::info!(peer = %name, ns = %ns, from_seq, target, pid = %pid, "sending pull");
         self.swarm
             .behaviour_mut()
             .sync
@@ -430,6 +434,7 @@ impl Runner {
     }
 
     fn on_records(&mut self, pid: PeerId, recs: Records) {
+        tracing::info!(%pid, n = recs.records.len(), ns = %recs.ns, "records received");
         let name = match self.name_for_pid(pid) {
             Some(n) => n,
             None => return,
@@ -522,6 +527,7 @@ impl Runner {
                 let _ = self.swarm.behaviour_mut().sync.send_response(channel, resp);
             }
             SyncRequest::Pull { ns, from_seq } => {
+                tracing::info!(%peer, ns = %ns, from_seq, "inbound pull");
                 let records = {
                     let store = self.engine.store.lock();
                     match store.log_records(&ns, from_seq) {
@@ -565,7 +571,15 @@ impl Runner {
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, connection_id: _, .. } => {
                 if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
                     let key = addr_key(&address);
-                    if let Some(name) = self.pending_dials.remove(&key) {
+                    let name = self.pending_dials.remove(&key).or_else(|| {
+                        // Dial-by-PeerId path (address already known): the
+                        // peer is WaitingDial with no bound pid — bind it.
+                        self.peer
+                            .iter()
+                            .find(|(_, c)| c.phase == Phase::WaitingDial && c.pid.is_none())
+                            .map(|(n, _)| n.clone())
+                    });
+                    if let Some(name) = name {
                         let bind = {
                             let c = self.peer.get_mut(&name).unwrap();
                             c.pid = Some(peer_id);
@@ -581,6 +595,28 @@ impl Runner {
                 if let Some(name) = self.name_for_pid(peer_id) {
                     if self.peer.get(&name).map(|c| c.phase.clone()) == Some(Phase::WaitingDial) {
                         self.phase_set(&name, Phase::Idle);
+                    }
+                }
+            }
+            SwarmEvent::OutgoingConnectionError { peer_id, error, connection_id: _, .. } => {
+                // A refused/failed dial must NOT strand the round: clear any
+                // pending dial marker and fall back to Idle so the next tick
+                // (or write trigger) retries.
+                tracing::warn!(%error, peer = ?peer_id, "outgoing connection error");
+                match peer_id {
+                    Some(pid) => {
+                        if let Some(name) = self.name_for_pid(pid) {
+                            self.phase_set(&name, Phase::Idle);
+                        }
+                    }
+                    None => {
+                        self.pending_dials.clear();
+                        for (name, ctx) in self.peer.iter_mut() {
+                            if ctx.phase == Phase::WaitingDial {
+                                ctx.phase = Phase::Idle;
+                                tracing::info!(peer = %name, "dial failed, back to Idle");
+                            }
+                        }
                     }
                 }
             }
@@ -637,5 +673,17 @@ impl Runner {
         if let Err(e) = cfg.save(&self.engine.cfg_path) {
             tracing::warn!(%e, "persist pin");
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn dbg_peer_id() {
+        let pk: crate::core::ident::PublicKey =
+            std::fs::read_to_string("/tmp/meshA/pk").unwrap().trim().parse().unwrap();
+        let ed = libp2p::identity::ed25519::PublicKey::try_from_bytes(&pk.to_bytes()).unwrap();
+        let pubk = libp2p::identity::PublicKey::from(ed);
+        let pid = libp2p::PeerId::from_public_key(&pubk);
+        eprintln!("computed: {pid}");
     }
 }

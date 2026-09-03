@@ -95,7 +95,9 @@ fn exec(ctx: &mut QueryCtx, call: &Call) -> Result<Value, QueryError> {
             let host = str_arg(ctx, &call.args[0])?;
             // M3: peer-clock estimate from sync; Null before any Hello sample.
             match ctx.store.peer_clock(&host) {
-                Some(diff) => Ok(Value::Num(diff as u64)),
+                // Estimate = how far ahead the peer's clock is; clamp
+                // negatives to 0 (peer behind ⇒ no meaningful positive skew).
+                Some(diff) => Ok(Value::Num(diff.max(0) as u64)),
                 None => Ok(Value::Null),
             }
         }
