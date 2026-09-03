@@ -10,7 +10,7 @@ use crate::core::hlc::Hlc;
 use crate::storage::{Entry, Store};
 use fuser::{Errno, FileAttr, FileHandle, Filesystem, INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, RenameFlags, TimeOrNow, WriteFlags, AccessFlags, BsdFileFlags};
 use libc::{ENOENT as L_ENOENT, ENOSPC as L_ENOSPC, EIO as L_EIO};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -23,7 +23,7 @@ const TTL: std::time::Duration = std::time::Duration::from_secs(0);
 const ROOT_INO: u64 = 1;
 
 pub struct MeshFs {
-    store: Arc<Mutex<Store>>,
+    store: Arc<RwLock<Store>>,
     ns: String,
     /// ino → path bytes ("" = root). Synthesized on demand, stable per run.
     ino_map: Mutex<HashMap<u64, Vec<u8>>>,
@@ -34,7 +34,7 @@ pub struct MeshFs {
 }
 
 impl MeshFs {
-    pub fn new(store: Arc<Mutex<Store>>, root_pk: [u8; 32]) -> MeshFs {
+    pub fn new(store: Arc<RwLock<Store>>, root_pk: [u8; 32]) -> MeshFs {
         let ns = format!("u/{}", hex::encode(root_pk));
         let mut map = HashMap::new();
         map.insert(ROOT_INO, Vec::<u8>::new());
@@ -102,14 +102,14 @@ impl MeshFs {
 
     /// Does a file exist at `path`?
     fn file_exists(&self, path: &[u8]) -> bool {
-        let store = self.store.lock();
+        let store = self.store.read();
         !store.get(&self.ns, &Self::key_of(path)).is_none()
     }
 
     /// Is `path` a directory? (any key strictly under it)
     fn dir_exists(&self, path: &[u8]) -> bool {
         let prefix = Self::dir_prefix(path);
-        let store = self.store.lock();
+        let store = self.store.read();
         store.scan(&self.ns, &prefix).iter().any(|(k, _)| k.len() >= prefix.len())
     }
 
@@ -123,7 +123,7 @@ impl MeshFs {
     }
 
     fn latest_len(&self, path: &[u8]) -> Option<u64> {
-        let store = self.store.lock();
+        let store = self.store.read();
         let e = store.get(&self.ns, &Self::key_of(path))?;
         match e {
             Entry::Lww(v) => Some(v.value.len() as u64),
@@ -135,7 +135,7 @@ impl MeshFs {
     }
 
     fn latest_hlc(&self, path: &[u8]) -> Option<u64> {
-        let store = self.store.lock();
+        let store = self.store.read();
         let e = store.get(&self.ns, &Self::key_of(path))?;
         match e {
             Entry::Lww(v) => Some(v.hlc),
@@ -171,7 +171,7 @@ impl MeshFs {
 
     /// Put full file contents (commit on flush).
     fn commit(&self, path: &[u8], data: Vec<u8>) -> std::io::Result<()> {
-        let mut store = self.store.lock();
+        let mut store = self.store.write();
         let hlc = Hlc::now().to_u64();
         let rid = hex::decode(&self.ns[2..]).unwrap_or_default();
         let mut rid_arr = [0u8; 32];
@@ -185,7 +185,7 @@ impl MeshFs {
     }
 
     fn delete_path(&self, path: &[u8]) -> std::io::Result<()> {
-        let mut store = self.store.lock();
+        let mut store = self.store.write();
         let hlc = Hlc::now().to_u64();
         let rid_hex = &self.ns[2..];
         let rid = hex::decode(rid_hex).unwrap_or_default();
@@ -204,7 +204,7 @@ impl MeshFs {
 
     /// Delete every key under a directory prefix (rmdir).
     fn delete_all_under(&self, path: &[u8]) -> std::io::Result<()> {
-        let mut store = self.store.lock();
+        let mut store = self.store.write();
         let hlc = Hlc::now().to_u64();
         let rid_hex = &self.ns[2..];
         let rid = hex::decode(rid_hex).unwrap_or_default();
@@ -270,7 +270,7 @@ impl Filesystem for MeshFs {
         };
         let prefix = Self::dir_prefix(&path);
         let children: std::collections::BTreeMap<OsString, bool> = {
-            let store = self.store.lock();
+            let store = self.store.read();
             let rows = store.scan(&self.ns, &prefix);
             // Unique immediate children (name base, dir marker).
             let mut children: std::collections::BTreeMap<OsString, bool> = std::collections::BTreeMap::new();
@@ -328,7 +328,7 @@ impl Filesystem for MeshFs {
         let fh = fuser::FileHandle(self.next_fh.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         // Preload buffer with the current value so partial writes keep the rest.
         let cur = {
-            let store = self.store.lock();
+            let store = self.store.read();
             match store.get(&self.ns, &Self::key_of(&path)) {
                 Some(Entry::Lww(v)) => Some(v.value.clone()),
                 Some(Entry::Register(vs)) => vs
@@ -347,7 +347,7 @@ impl Filesystem for MeshFs {
         // Content always comes from the store (single source of truth).
         let data = match self.path_of(ino) {
             Some(path) => {
-                let store = self.store.lock();
+                let store = self.store.read();
                 match store.get(&self.ns, &Self::key_of(&path)) {
                     Some(Entry::Lww(v)) => Some(v.value.clone()),
                     Some(Entry::Register(vs)) => Some(
@@ -450,7 +450,7 @@ impl Filesystem for MeshFs {
         marker.extend_from_slice(&path);
         marker.push(b'/');
         {
-            let mut store = self.store.lock();
+            let mut store = self.store.write();
             let hlc = Hlc::now().to_u64();
             let rid = hex::decode(&self.ns[2..]).unwrap_or_default();
             let mut rid_arr = [0u8; 32];
@@ -504,7 +504,7 @@ impl Filesystem for MeshFs {
         let to = Self::join_child(&new_parent, newname.as_bytes());
         if self.file_exists(&from) {
             let data = {
-                let store = self.store.lock();
+                let store = self.store.read();
                 match store.get(&self.ns, &Self::key_of(&from)) {
                     Some(Entry::Lww(v)) => Some(v.value.clone()),
                     Some(Entry::Register(vs)) => Some(
@@ -533,7 +533,7 @@ impl Filesystem for MeshFs {
             // Rename a directory: copy all keys under prefix, then delete.
             let old_pref = Self::dir_prefix(&from);
             let new_pref = Self::dir_prefix(&to);
-            let mut store = self.store.lock();
+            let mut store = self.store.write();
             let hlc = Hlc::now().to_u64();
             let rid = hex::decode(&self.ns[2..]).unwrap_or_default();
             let mut rid_arr = [0u8; 32];
@@ -596,7 +596,7 @@ impl Filesystem for MeshFs {
             // Truncate/pad to size, commit.
             let cur = self.latest_len(&path).unwrap_or(0);
             let mut data = {
-                let store = self.store.lock();
+                let store = self.store.read();
                 match store.get(&self.ns, &Self::key_of(&path)) {
                     Some(Entry::Lww(v)) => v.value.clone(),
                     Some(Entry::Register(vs)) => vs
@@ -656,7 +656,7 @@ mod tests {
         let root = [42u8; 32];
         let ns = format!("u/{}", hex::encode(root));
         store.create_namespace(&ns, ConflictPolicy::Lww).unwrap();
-        let store = Arc::new(Mutex::new(store));
+        let store = Arc::new(RwLock::new(store));
         let fs = MeshFs::new(store.clone(), root);
         let mnt = dir.join("mnt");
         std::fs::create_dir_all(&mnt).unwrap();

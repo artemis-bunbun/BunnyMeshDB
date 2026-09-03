@@ -5,7 +5,7 @@ pub mod config;
 use crate::caps::{Capability, PermSet, RevocationSet, Scope, Tier};
 use crate::core::hlc::Hlc;
 use crate::core::ident::{Keypair, PublicKey};
-use crate::ns::{account_write, authorize_cached, ensure_l3_namespace};
+use crate::ns::{account_write, authorize_cached, ensure_l3_namespace, CapCache};
 use crate::query::{QueryCtx, eval};
 use crate::storage::{ConflictPolicy, Entry, StorageError, Store};
 use crate::util::{b64_encode, b64url_decode};
@@ -18,14 +18,14 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value as JValue};
 use std::collections::HashMap;
-use parking_lot::{Mutex as PLMutex, RwLock as PLRwLock};
+use parking_lot::RwLock as PLRwLock;
 use std::sync::Arc;
 
 // ---------- state ----------
 
 #[derive(Clone)]
 pub struct AppState {
-    pub store: Arc<PLMutex<Store>>,
+    pub store: Arc<PLRwLock<Store>>,
     pub root: PublicKey,
     pub kp: Arc<Keypair>,
     pub revocations: Arc<PLRwLock<RevocationSet>>,
@@ -37,7 +37,7 @@ pub struct AppState {
     /// against this epoch are valid until it changes.
     pub rev_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// cap nonce → epoch it was fully verified in (bounded; see ns.rs).
-    pub cap_cache: Arc<PLMutex<HashMap<u64, u64>>>,
+    pub cap_cache: Arc<CapCache>,
 }
 
 impl AppState {
@@ -124,8 +124,7 @@ fn auth_l1_l2(
     // happened-before (visible to this reader) or is blocked on the write
     // lock, so a cached hit can never mask a revocation.
     let epoch = state.rev_epoch.load(std::sync::atomic::Ordering::SeqCst);
-    let mut cache = state.cap_cache.lock();
-    authorize_cached(scope, &principal, perms, &caps.0, &state.root, &revs, &state.host_name, now_ms, Some(&mut cache), epoch)
+    authorize_cached(scope, &principal, perms, &caps.0, &state.root, &revs, &state.host_name, now_ms, Some(&*state.cap_cache), epoch)
         .map_err(auth_to_response)?;
     Ok(principal)
 }
@@ -207,7 +206,7 @@ async fn l1_list_namespaces(
         Ok(_) => {}
         Err(r) => return r,
     }
-    let store = state.store.lock();
+    let store = state.store.read();
     let namespaces: Vec<JValue> = store
         .namespaces()
         .into_iter()
@@ -233,7 +232,7 @@ async fn l1_create_namespace(
         "register" => ConflictPolicy::CrdtRegister,
         _ => return err_json(StatusCode::BAD_REQUEST, "bad_request"),
     };
-    let mut store = state.store.lock();
+    let mut store = state.store.write();
     match store.create_namespace(&body.name, policy) {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
         Err(StorageError::NamespaceExists(_)) => err_json(StatusCode::CONFLICT, "namespace_exists"),
@@ -282,7 +281,7 @@ async fn l1_issue_cap(
     let mut nonce = [0u8; 8];
     getrandom::fill(&mut nonce).expect("os rng");
     let cap = Capability::sign_for(target, perms, body.expiry_ms, u64::from_le_bytes(nonce), subject, &state.kp);
-    let mut store = state.store.lock();
+    let mut store = state.store.write();
     let mut ledger = store
         .meta_get("sys/caps")
         .map(|v| String::from_utf8_lossy(v).into_owned())
@@ -301,7 +300,7 @@ async fn l1_list_caps(
         Ok(_) => {}
         Err(r) => return r,
     }
-    let store = state.store.lock();
+    let store = state.store.read();
     let ledger = store.meta_get("sys/caps").map(|v| v.to_vec()).unwrap_or_default();
     let mut out = Vec::new();
     for line in String::from_utf8_lossy(&ledger).lines() {
@@ -344,7 +343,7 @@ async fn l1_revoke(
         // reads the new epoch is guaranteed to observe this revocation.
         state.rev_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
-    let mut store = state.store.lock();
+    let mut store = state.store.write();
     let mut ledger = store
         .meta_get("sys/revocations")
         .map(|v| String::from_utf8_lossy(v).into_owned())
@@ -423,7 +422,7 @@ fn handle_scan(state: &AppState, caps: Option<&AuthCaps>, ns: &str, query: HashM
         Ok(_) => {}
         Err(r) => return r,
     }
-    let store = state.store.lock();
+    let store = state.store.read();
     let rows = store.scan(ns, p.as_bytes());
     let entries: Vec<JValue> = rows
         .into_iter()
@@ -454,7 +453,7 @@ fn handle_data(
     match method {
         Method::GET => {
             if let Some(p) = query.get("prefix") {
-                let store = state.store.lock();
+                let store = state.store.read();
                 let rows = store.scan(ns, p.as_bytes());
                 let entries: Vec<JValue> = rows
                     .into_iter()
@@ -467,7 +466,7 @@ fn handle_data(
                     .collect();
                 Json(json!({ "entries": entries })).into_response()
             } else {
-                let store = state.store.lock();
+                let store = state.store.read();
                 match store.get(ns, &k) {
                     Some(e) => latest_value(e)
                         .map(|v| v.into_response())
@@ -477,7 +476,7 @@ fn handle_data(
             }
         }
         Method::PUT => {
-            let mut store = state.store.lock();
+            let mut store = state.store.write();
             if tier == Tier::L3 {
                 if let Err(e) = ensure_l3_namespace(&mut store, &principal) {
                     return auth_to_response(e);
@@ -503,7 +502,7 @@ fn handle_data(
             }
         }
         Method::DELETE => {
-            let mut store = state.store.lock();
+            let mut store = state.store.write();
             if store.policy(ns).is_none() {
                 return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
             }
@@ -540,7 +539,7 @@ fn run_ql(state: &AppState, caps: Option<&AuthCaps>, ns: &str, expr: &str) -> Re
         Ok(_) => {}
         Err(r) => return r,
     }
-    let mut store = state.store.lock();
+    let mut store = state.store.write();
     let mut ctx = QueryCtx { store: &mut store, scope: Some(ns.to_string()), host_id: state.root };
     match eval(&mut ctx, expr) {
         Ok(v) => {

@@ -100,7 +100,7 @@ async fn main() {
 
     // --- mesh sync (M3) ---
     let (sync_tx, sync_rx) = tokio::sync::mpsc::channel::<()>(64);
-    let store_arc: Arc<Mutex<bunnymeshdb::storage::Store>> = Arc::new(Mutex::new(store));
+    let store_arc: Arc<RwLock<bunnymeshdb::storage::Store>> = Arc::new(RwLock::new(store));
     let sync_cfg = Arc::new(Mutex::new(cfg.clone()));
     let engine = bunnymeshdb::net::SyncEngine::new(
         store_arc.clone(),
@@ -119,7 +119,7 @@ async fn main() {
         default_quota: cfg.node.l3.default_quota,
         sync_tx: Some(sync_tx),
         rev_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        cap_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        cap_cache: Arc::new(bunnymeshdb::ns::CapCache::new()),
     };
 
     // L3-as-filesystem (M4): mount in a background thread when requested.
@@ -131,7 +131,7 @@ async fn main() {
         // Provision the L3 namespace the mount backs (`u/<root>`, LWW),
         // mirroring ensure_l3_namespace — without it every write fails BadName.
         {
-            let mut store = state.store.lock();
+            let mut store = state.store.write();
             let ns = format!("u/{}", root);
             if store.policy(&ns).is_none() {
                 if let Err(e) = store.create_namespace(&ns, bunnymeshdb::storage::ConflictPolicy::Lww) {
@@ -159,7 +159,7 @@ async fn main() {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             tick.tick().await;
-            ckpt_store.lock().checkpoint().ok();
+            ckpt_store.write().checkpoint().ok();
         }
     });
 
@@ -182,7 +182,7 @@ async fn main() {
 }
 
 /// Wait for SIGINT/SIGTERM; checkpoint the store on the way out.
-async fn shutdown_signal(store: Arc<Mutex<Store>>) {
+async fn shutdown_signal(store: Arc<RwLock<Store>>) {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     let term = {
@@ -197,5 +197,5 @@ async fn shutdown_signal(store: Arc<Mutex<Store>>) {
         _ = term => {}
     }
     tracing::info!("signal received, checkpointing");
-    store.lock().checkpoint().ok();
+    store.write().checkpoint().ok();
 }

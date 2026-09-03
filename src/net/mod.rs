@@ -23,7 +23,7 @@ use futures::StreamExt;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, PeerId, StreamProtocol};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -95,7 +95,7 @@ impl Behaviour {
 // ---------- engine ----------
 
 pub struct SyncEngine {
-    pub store: Arc<Mutex<Store>>,
+    pub store: Arc<RwLock<Store>>,
     /// Our node keypair; doubles as the libp2p identity (same ed25519 seed).
     pub kp: crate::core::ident::Keypair,
     pub cfg: Arc<Mutex<Config>>,
@@ -106,7 +106,7 @@ pub struct SyncEngine {
 
 impl SyncEngine {
     pub fn new(
-        store: Arc<Mutex<Store>>,
+        store: Arc<RwLock<Store>>,
         kp: crate::core::ident::Keypair,
         cfg: Arc<Mutex<Config>>,
         cfg_path: PathBuf,
@@ -165,7 +165,7 @@ impl SyncEngine {
                 event = runner.swarm.select_next_some() => runner.handle(event),
             }
         }
-        runner.engine.store.lock().checkpoint().ok();
+        runner.engine.store.write().checkpoint().ok();
         tracing::info!("sync loop exiting");
     }
 }
@@ -392,12 +392,12 @@ impl Runner {
             v.sort_unstable();
             v[v.len() / 2]
         };
-        self.engine.store.lock().set_peer_clock(&name, median);
+        self.engine.store.write().set_peer_clock(&name, median);
 
         // Namespaces to pull: we host them and the peer is ahead.
         let mut pulls: Vec<(String, u64)> = Vec::new();
         {
-            let store = self.engine.store.lock();
+            let store = self.engine.store.read();
             for nh in &resp.namespaces {
                 if store.policy(&nh.ns).is_none() {
                     continue;
@@ -422,7 +422,7 @@ impl Runner {
     fn send_pull(&mut self, name: String, ns: String, target: u64) {
         let pid = self.peer.get(&name).unwrap().pid.unwrap();
         let from_seq = {
-            let store = self.engine.store.lock();
+            let store = self.engine.store.read();
             store.head(&ns).map(|(s, _)| s + 1).unwrap_or(1)
         };
         tracing::info!(peer = %name, ns = %ns, from_seq, target, pid = %pid, "sending pull");
@@ -473,7 +473,7 @@ impl Runner {
         let mut apply_failed = false;
         let local_seq;
         {
-            let mut store = self.engine.store.lock();
+            let mut store = self.engine.store.write();
             match store.apply_synced_batch(&ns, &parsed) {
                 Ok(n) => self.round_applied += n,
                 Err(e) => {
@@ -515,7 +515,7 @@ impl Runner {
         match request {
             SyncRequest::Hello => {
                 let (host_id, hlc, namespaces) = {
-                    let store = self.engine.store.lock();
+                    let store = self.engine.store.read();
                     let namespaces = store
                         .namespaces_with_head()
                         .into_iter()
@@ -529,7 +529,7 @@ impl Runner {
             SyncRequest::Pull { ns, from_seq } => {
                 tracing::info!(%peer, ns = %ns, from_seq, "inbound pull");
                 let records = {
-                    let store = self.engine.store.lock();
+                    let store = self.engine.store.read();
                     match store.log_records(&ns, from_seq) {
                         Ok(recs) => {
                             let mut out = Vec::new();

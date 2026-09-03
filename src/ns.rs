@@ -6,6 +6,8 @@
 use crate::caps::{Capability, PermSet, RevocationSet, Scope, Tier};
 use crate::core::ident::PublicKey;
 use crate::storage::{ConflictPolicy, Store};
+use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthError {
@@ -59,6 +61,28 @@ pub fn authorize(
 /// verified in; the caller bumps `epoch` whenever a revocation lands, so a
 /// cached hit can only happen when no revocation has occurred since the
 /// verification. Cheap checks (issuer, subject, expiry) always run.
+/// Sharded capability-verify cache: cap `nonce` → `epoch` it was fully
+/// verified in. Reads are lock-free (per-shard atomic ticker guards each
+/// shard's bounded map); writes take only the target shard's lock.
+pub struct CapCache {
+    /// Per-shard entry generation; bumps when a shard is cleared so in-flight
+    /// readers can't see a stale hit after a clear.
+    ticks: [AtomicU64; 256],
+    /// Map per shard (indexed by `nonce % 256`).
+    shards: [parking_lot::Mutex<HashMap<u64, u64>>; 256],
+    /// Cached epoch per shard (mirror of `ticks` for fast path).
+    epochs: [AtomicU64; 256],
+}
+
+impl CapCache {
+    pub fn new() -> Self {
+        let ticks = std::array::from_fn(|_| AtomicU64::new(0));
+        let shards = std::array::from_fn(|_| parking_lot::Mutex::new(HashMap::new()));
+        let epochs = std::array::from_fn(|_| AtomicU64::new(0));
+        CapCache { ticks, shards, epochs }
+    }
+}
+
 pub fn authorize_cached(
     scope: &Scope,
     principal: &PublicKey,
@@ -68,7 +92,7 @@ pub fn authorize_cached(
     revocations: &RevocationSet,
     host_name: &str,
     now_ms: u64,
-    mut cache: Option<&mut std::collections::HashMap<u64, u64>>,
+    cache: Option<&CapCache>,
     epoch: u64,
 ) -> Result<(), AuthError> {
     if scope.host != host_name {
@@ -102,7 +126,7 @@ pub fn authorize_cached(
                         .verify_or_cached(root, principal, revocations, now_ms, cached_ok)
                         .is_ok();
                 if ok {
-                    mark_verified(cache.as_deref_mut(), &cap.nonce, epoch, cached_ok);
+                    mark_verified(cache.as_deref(), &cap.nonce, epoch, cached_ok);
                     return Ok(());
                 }
             }
@@ -120,7 +144,7 @@ pub fn authorize_cached(
                     && cap.scope.covers(scope)
                     && cap.perms.contains(perms)
                 {
-                    mark_verified(cache.as_deref_mut(), &cap.nonce, epoch, cached_ok);
+                    mark_verified(cache.as_deref(), &cap.nonce, epoch, cached_ok);
                     return Ok(());
                 }
             }
@@ -132,26 +156,31 @@ pub fn authorize_cached(
     }
 }
 
-/// Was `nonce` fully verified in `epoch`?
-fn epoch_ok(cache: Option<&std::collections::HashMap<u64, u64>>, nonce: &u64, epoch: u64) -> bool {
-    cache.map(|m| m.get(nonce).copied() == Some(epoch)).unwrap_or(false)
+/// Was `nonce` fully verified in `epoch`? Lock-free read per shard.
+fn epoch_ok(cache: Option<&CapCache>, nonce: &u64, epoch: u64) -> bool {
+    let Some(c) = cache else { return false };
+    let shard = (nonce % 256) as usize;
+    let ticks = c.ticks[shard].load(std::sync::atomic::Ordering::Acquire);
+    if ticks != c.epochs[shard].load(std::sync::atomic::Ordering::Acquire) {
+        // Shard was cleared since the last entry; nothing is valid here.
+        return false;
+    }
+    c.shards[shard].try_lock().map(|m| m.get(nonce).copied() == Some(epoch)).unwrap_or(false)
 }
 
 /// Record a full verification in `cache` (bounded; caps are few per node).
-fn mark_verified(
-    cache: Option<&mut std::collections::HashMap<u64, u64>>,
-    nonce: &u64,
-    epoch: u64,
-    cached_ok: bool,
-) {
-    if let Some(m) = cache {
-        if !cached_ok {
-            if m.len() >= 8192 {
-                m.clear();
-            }
-            m.insert(*nonce, epoch);
-        }
+fn mark_verified(cache: Option<&CapCache>, nonce: &u64, epoch: u64, cached_ok: bool) {
+    let Some(c) = cache else { return };
+    if cached_ok {
+        return;
     }
+    let shard = (nonce % 256) as usize;
+    let mut m = c.shards[shard].lock();
+    if m.len() >= 8192 {
+        m.clear();
+        c.ticks[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+    m.insert(*nonce, epoch);
 }
 
 impl Capability {
