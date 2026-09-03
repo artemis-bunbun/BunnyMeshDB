@@ -225,6 +225,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "fuser",
  "futures",
+ "getrandom 0.4.3",
  "hex",
  "libp2p",
  "rand 0.10.2",
