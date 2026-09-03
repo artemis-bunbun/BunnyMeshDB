@@ -56,9 +56,36 @@ impl From<std::io::Error> for StorageError {
     }
 }
 
-/// Path for a namespace's data directory under the store root: hex of the name.
+/// Path for a namespace's data directory under the store root.
+///
+/// Names may contain `/` (`u/<pk>`), so a raw hex encoding would collide with
+/// subdirectory traversal; instead the dir name is `<hexlen>_<hex(ns)>` where
+/// hexlen is the hex length in decimal. `<=64`-char names hex-encode to
+/// `<=128` chars and old two-hex-char dirs (pre-fix) had hexlen 2 — the
+/// decode below is unambiguous either way.
 pub fn ns_dir(root: &Path, ns: &str) -> PathBuf {
-    root.join(hex::encode(ns.as_bytes()))
+    let hexlen = ns.len() * 2;
+    root.join(format!("{hexlen:x}_{}", hex::encode(ns.as_bytes())))
+}
+
+/// Parse a namespace dir name back to (`ns_name`, `ns_hex`) — `None` if not
+/// a namespace dir. Accepts any `^[0-9a-f]+_[0-9a-f]+$` with hexlen matching.
+fn parse_ns_dir(name: &str) -> Option<String> {
+    let (len_s, rest) = name.split_once('_')?;
+    let hexlen = usize::from_str_radix(len_s, 16).ok()?;
+    if !len_s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if rest.len() != hexlen || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let decoded = hex::decode(rest).ok()?;
+    let ns = String::from_utf8(decoded).ok()?;
+    if valid_ns(&ns) {
+        Some(ns)
+    } else {
+        None
+    }
 }
 
 /// One write to one key; `seq` is its record number in the namespace log.
@@ -158,11 +185,18 @@ impl<'a> R<'a> {
 }
 
 fn valid_ns(name: &str) -> bool {
-    !name.is_empty()
+    // Flat names: ^[a-z0-9._-]{1,64}$.
+    let flat = !name.is_empty()
         && name.len() <= 64
         && name.bytes().all(|b| {
             b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'_' || b == b'-'
-        })
+        });
+    // L3 owner reservation: u/<64 hex chars>.
+    let l3_owner = name
+        .strip_prefix("u/")
+        .map(|rest| rest.len() == 64 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or(false);
+    flat || l3_owner
 }
 
 fn policy_to_u8(p: ConflictPolicy) -> u8 {
@@ -243,18 +277,10 @@ impl Store {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            // Namespace dirs are hex(1..=64 bytes) = 2..=128 hex chars.
-            if name.len() < 2
-                || name.len() > 128
-                || name.len() % 2 != 0
-                || !name.bytes().all(|b| b.is_ascii_hexdigit())
-            {
-                continue;
-            }
-            let Ok(decoded) = hex::decode(&name) else { continue };
-            let Ok(ns) = String::from_utf8(decoded) else { continue };
-            if valid_ns(&ns) && !ns_names.contains(&ns) {
-                ns_names.push(ns);
+            if let Some(ns) = parse_ns_dir(&name) {
+                if !ns_names.contains(&ns) {
+                    ns_names.push(ns);
+                }
             }
         }
         ns_names.sort();
