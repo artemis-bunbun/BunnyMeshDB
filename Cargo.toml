@@ -16,6 +16,7 @@ fuser = "0.18.0"
 futures = "0.3.34"
 getrandom = "0.4.3"
 hex = "0.4.3"
+libc = "0.2.189"
 libp2p = { version = "0.56.0", features = ["tokio", "tcp", "noise", "yamux", "request-response", "json", "ed25519", "identify"] }
 parking_lot = "0.12.5"
 rand = "0.10.2"

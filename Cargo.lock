@@ -370,6 +370,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "hex",
+ "libc",
  "libp2p",
  "parking_lot",
  "rand 0.10.2",

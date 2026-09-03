@@ -2,6 +2,7 @@
 
 pub mod caps;
 pub mod core;
+pub mod fs;
 pub mod net;
 pub mod ns;
 pub mod util;

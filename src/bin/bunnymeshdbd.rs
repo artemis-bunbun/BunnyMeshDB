@@ -21,10 +21,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve the HTTP API.
+    /// Serve the HTTP API (+ optional L3 FUSE mount).
     Serve {
         #[arg(long)]
         config: PathBuf,
+        /// Mount the L3 filesystem at this path (Linux + /dev/fuse).
+        #[arg(long)]
+        mount: Option<PathBuf>,
     },
 }
 
@@ -34,8 +37,8 @@ async fn main() {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
     let cli = Cli::parse();
-    let config_path = match cli.cmd {
-        Cmd::Serve { config } => config,
+    let (config_path, mount_at) = match cli.cmd {
+        Cmd::Serve { config, mount } => (config, mount),
     };
     let cfg = match Config::load(&config_path) {
         Ok(c) => c,
@@ -116,6 +119,37 @@ async fn main() {
         default_quota: cfg.node.l3.default_quota,
         sync_tx: Some(sync_tx),
     };
+
+    // L3-as-filesystem (M4): mount in a background thread when requested.
+    if let Some(mnt) = mount_at {
+        if !std::path::Path::new("/dev/fuse").exists() {
+            eprintln!("fatal: --mount requires /dev/fuse");
+            std::process::exit(1);
+        }
+        // Provision the L3 namespace the mount backs (`u/<root>`, LWW),
+        // mirroring ensure_l3_namespace — without it every write fails BadName.
+        {
+            let mut store = state.store.lock();
+            let ns = format!("u/{}", root);
+            if store.policy(&ns).is_none() {
+                if let Err(e) = store.create_namespace(&ns, bunnymeshdb::storage::ConflictPolicy::Lww) {
+                    eprintln!("fatal: provision L3 namespace: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        let fs = bunnymeshdb::fs::MeshFs::new(state.store.clone(), root.to_bytes());
+        match fs.mount_and_run(mnt.clone()) {
+            Ok(()) => tracing::info!(mount = %mnt.display(), "L3 filesystem mounted"),
+            Err(e) => {
+                eprintln!("fatal: mount {}: {e}", mnt.display());
+                std::process::exit(1);
+            }
+        }
+        // `_session` lives until process exit: its BackgroundSession drops on
+        // process teardown, unmounting the FUSE connection so no stale mount
+        // (Transport endpoint is not connected) survives a restart.
+    }
 
     // Periodic checkpoint every 60 s.
     let ckpt_store = state.store.clone();
