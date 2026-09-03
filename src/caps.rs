@@ -325,6 +325,42 @@ impl Capability {
         Ok(())
     }
 
+    /// Like [`verify`], but skips the signature check and revocation scan when
+    /// `cached_ok` is set — the caller guarantees the cap was fully verified
+    /// against the current revocation epoch (see `authorize_cached`). The
+    /// cheap checks (issuer, subject, expiry) still run every request so an
+    /// expired token is never honored via the cache.
+    pub fn verify_or_cached(
+        &self,
+        root: &PublicKey,
+        principal: &PublicKey,
+        revocations: &RevocationSet,
+        now_ms: u64,
+        cached_ok: bool,
+    ) -> Result<(), CapError> {
+        if self.issuer != *root {
+            return Err(CapError::BadIssuer);
+        }
+        if self.subject != *principal {
+            return Err(CapError::Malformed); // presented by wrong principal
+        }
+        if let Some(exp) = self.expiry_ms {
+            if now_ms >= exp {
+                return Err(CapError::Expired);
+            }
+        }
+        if cached_ok {
+            return Ok(());
+        }
+        if !root.verify(&self.canonical_bytes(), &self.sig) {
+            return Err(CapError::BadSig);
+        }
+        if revocations.is_revoked(&self.scope, &principal.to_string(), self.nonce) {
+            return Err(CapError::Revoked);
+        }
+        Ok(())
+    }
+
     /// Header wire form: `bmdb-cap:<base64url(cap_json)>`.
     pub fn to_header(&self) -> String {
         format!("bmdb-cap:{}", b64url_encode(&self.to_json().into_bytes()))

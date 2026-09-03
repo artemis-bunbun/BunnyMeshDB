@@ -5,7 +5,7 @@ pub mod config;
 use crate::caps::{Capability, PermSet, RevocationSet, Scope, Tier};
 use crate::core::hlc::Hlc;
 use crate::core::ident::{Keypair, PublicKey};
-use crate::ns::{account_write, authorize, ensure_l3_namespace};
+use crate::ns::{account_write, authorize_cached, ensure_l3_namespace};
 use crate::query::{QueryCtx, eval};
 use crate::storage::{ConflictPolicy, Entry, StorageError, Store};
 use crate::util::{b64_encode, b64url_decode};
@@ -33,6 +33,11 @@ pub struct AppState {
     pub default_quota: u64,
     /// Mesh sync trigger: fired immediately after writes commit.
     pub sync_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Revocation epoch — bumped on every revoke. Cap verify results cached
+    /// against this epoch are valid until it changes.
+    pub rev_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// cap nonce → epoch it was fully verified in (bounded; see ns.rs).
+    pub cap_cache: Arc<PLMutex<HashMap<u64, u64>>>,
 }
 
 impl AppState {
@@ -115,7 +120,12 @@ fn auth_l1_l2(
         .map(|c| c.subject)
         .ok_or_else(|| err_json(StatusCode::UNAUTHORIZED, "invalid_capability"))?;
     let revs = state.revocations.read();
-    authorize(scope, &principal, perms, &caps.0, &state.root, &revs, &state.host_name, now_ms)
+    // Read the epoch AFTER taking the read lock: a concurrent revoke either
+    // happened-before (visible to this reader) or is blocked on the write
+    // lock, so a cached hit can never mask a revocation.
+    let epoch = state.rev_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    let mut cache = state.cap_cache.lock();
+    authorize_cached(scope, &principal, perms, &caps.0, &state.root, &revs, &state.host_name, now_ms, Some(&mut cache), epoch)
         .map_err(auth_to_response)?;
     Ok(principal)
 }
@@ -130,7 +140,7 @@ fn auth_l3(state: &AppState, scope: &Scope, now_ms: u64) -> Result<PublicKey, Re
         .parse::<PublicKey>()
         .map_err(|_| err_json(StatusCode::FORBIDDEN, "forbidden"))?;
     let revs = state.revocations.read();
-    authorize(scope, &pk, PermSet::READ.union(PermSet::WRITE), &[], &state.root, &revs, &state.host_name, now_ms)
+    authorize_cached(scope, &pk, PermSet::READ.union(PermSet::WRITE), &[], &state.root, &revs, &state.host_name, now_ms, None, 0)
         .map_err(auth_to_response)?;
     Ok(pk)
 }
@@ -330,6 +340,9 @@ async fn l1_revoke(
     {
         let mut revs = state.revocations.write();
         revs.revoke_principal(&target_scope, &to.to_string());
+        // Bump under the same write lock, before release: any request that
+        // reads the new epoch is guaranteed to observe this revocation.
+        state.rev_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     let mut store = state.store.lock();
     let mut ledger = store

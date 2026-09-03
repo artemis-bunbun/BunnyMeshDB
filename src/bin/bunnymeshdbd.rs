@@ -118,6 +118,8 @@ async fn main() {
         host_name: cfg.node.name.clone(),
         default_quota: cfg.node.l3.default_quota,
         sync_tx: Some(sync_tx),
+        rev_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        cap_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
     };
 
     // L3-as-filesystem (M4): mount in a background thread when requested.

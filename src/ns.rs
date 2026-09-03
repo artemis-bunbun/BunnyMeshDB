@@ -50,6 +50,27 @@ pub fn authorize(
     host_name: &str,
     now_ms: u64,
 ) -> Result<(), AuthError> {
+    authorize_cached(scope, principal, perms, caps, root, revocations, host_name, now_ms, None, 0)
+}
+
+/// Like [`authorize`], but skips the per-request ed25519 signature check and
+/// revocation scan for capabilities previously verified in the current
+/// revocation `epoch`. `cache` maps a cap's `nonce` → the epoch it was fully
+/// verified in; the caller bumps `epoch` whenever a revocation lands, so a
+/// cached hit can only happen when no revocation has occurred since the
+/// verification. Cheap checks (issuer, subject, expiry) always run.
+pub fn authorize_cached(
+    scope: &Scope,
+    principal: &PublicKey,
+    perms: PermSet,
+    caps: &[Capability],
+    root: &PublicKey,
+    revocations: &RevocationSet,
+    host_name: &str,
+    now_ms: u64,
+    mut cache: Option<&mut std::collections::HashMap<u64, u64>>,
+    epoch: u64,
+) -> Result<(), AuthError> {
     if scope.host != host_name {
         return Err(AuthError::Unauthorized(format!(
             "scope host {:?} is not this host ({host_name:?})",
@@ -72,12 +93,16 @@ pub fn authorize(
         Tier::L1 => {
             // L1 caps must be host-root admin scope.
             for cap in caps {
+                let cached_ok = epoch_ok(cache.as_deref(), &cap.nonce, epoch);
                 let ok = cap.tier_ok(Tier::L1)
                     && cap.scope.tier == Tier::L1
                     && cap.scope.ns == "*"
                     && cap.perms.contains(PermSet::ADMIN)
-                    && cap.verify(root, principal, revocations, now_ms).is_ok();
+                    && cap
+                        .verify_or_cached(root, principal, revocations, now_ms, cached_ok)
+                        .is_ok();
                 if ok {
+                    mark_verified(cache.as_deref_mut(), &cap.nonce, epoch, cached_ok);
                     return Ok(());
                 }
             }
@@ -85,7 +110,8 @@ pub fn authorize(
         }
         Tier::L2 => {
             for cap in caps {
-                let valid = cap.verify(root, principal, revocations, now_ms);
+                let cached_ok = epoch_ok(cache.as_deref(), &cap.nonce, epoch);
+                let valid = cap.verify_or_cached(root, principal, revocations, now_ms, cached_ok);
                 if valid.is_err() {
                     // Try the next cap; the request is only denied if none hold.
                     continue;
@@ -94,6 +120,7 @@ pub fn authorize(
                     && cap.scope.covers(scope)
                     && cap.perms.contains(perms)
                 {
+                    mark_verified(cache.as_deref_mut(), &cap.nonce, epoch, cached_ok);
                     return Ok(());
                 }
             }
@@ -101,6 +128,28 @@ pub fn authorize(
                 "no capability covers {scope} with {:?}",
                 perms.names()
             )))
+        }
+    }
+}
+
+/// Was `nonce` fully verified in `epoch`?
+fn epoch_ok(cache: Option<&std::collections::HashMap<u64, u64>>, nonce: &u64, epoch: u64) -> bool {
+    cache.map(|m| m.get(nonce).copied() == Some(epoch)).unwrap_or(false)
+}
+
+/// Record a full verification in `cache` (bounded; caps are few per node).
+fn mark_verified(
+    cache: Option<&mut std::collections::HashMap<u64, u64>>,
+    nonce: &u64,
+    epoch: u64,
+    cached_ok: bool,
+) {
+    if let Some(m) = cache {
+        if !cached_ok {
+            if m.len() >= 8192 {
+                m.clear();
+            }
+            m.insert(*nonce, epoch);
         }
     }
 }
