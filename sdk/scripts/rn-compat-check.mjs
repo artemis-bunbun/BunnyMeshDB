@@ -8,7 +8,8 @@ for (const k of ["Buffer", "btoa", "atob", "TextEncoder", "TextDecoder"]) {
   saved[k] = g[k];
   try { delete g[k]; } catch { g[k] = undefined; }
 }
-const { b64urlEncode, b64Decode, utf8Encode, utf8Decode, StreamUtf8 } = await import("/home/artemisbunbun/BunnyMesh2/sdk/dist/compat.js");
+const compatUrl = new URL("../dist/compat.js", import.meta.url).href;
+const { b64urlEncode, b64Decode, utf8Encode, utf8Decode, StreamUtf8 } = await import(compatUrl);
 
 let pass = 0;
 const ok = (n, c, e = "") => { if (!c) throw new Error(`FAIL ${n} ${e}`); pass++; console.log(`ok ${pass} - ${n}${e ? ` (${e})` : ""}`); };
