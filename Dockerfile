@@ -11,7 +11,7 @@
 # Usage:
 #   docker build -t bunnymeshdb .
 #   docker run --rm -p 8848:8848 bunnymeshdb serve --config /etc/bmd/config.toml
-#   # or drop into a shell to `bunny init` + write a config first:
+#   # or drop into a shell to `bunnymeshdb init` + write a config first:
 #   docker run --rm -it bunnymeshdb sh
 
 # --- Build stage: rust toolchain on musl (glibc-free crates) ---
@@ -33,7 +33,7 @@ RUN cargo build --release --features mimalloc
 FROM alpine:latest
 RUN apk add --no-cache fuse3 curl && adduser -D -h /data bmd
 WORKDIR /data
-COPY --from=build /src/target/release/bunny /usr/local/bin/bunny
+COPY --from=build /src/target/release/bunnymeshdb /usr/local/bin/bunnymeshdb
 COPY --from=build /src/target/release/bunnymeshdbd /usr/local/bin/bunnymeshdbd
 USER bmd
 EXPOSE 8848

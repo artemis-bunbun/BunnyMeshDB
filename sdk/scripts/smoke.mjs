@@ -1,13 +1,13 @@
 // SDK smoke test — exercises the full typed surface against a live daemon.
-// Requires BUNNY_ADMIN (bmdb-cap:… token) and BUNNY_BASE (default
+// Requires BUNNYMESHDB_ADMIN (bmdb-cap:… token) and BUNNYMESHDB_BASE (default
 // http://127.0.0.1:8853). Run: node scripts/smoke.mjs
-import { BunnyClient, BunnyError } from "../dist/index.js";
+import { BunnyMeshClient, BunnyMeshError } from "../dist/index.js";
 
-const base = process.env.BUNNY_BASE ?? "http://127.0.0.1:8853";
-const admin = process.env.BUNNY_ADMIN;
-if (!admin) throw new Error("BUNNY_ADMIN required (admin cap token)");
+const base = process.env.BUNNYMESHDB_BASE ?? "http://127.0.0.1:8853";
+const admin = process.env.BUNNYMESHDB_ADMIN;
+if (!admin) throw new Error("BUNNYMESHDB_ADMIN required (admin cap token)");
 
-const client = new BunnyClient(base, admin);
+const client = new BunnyMeshClient(base, admin);
 let pass = 0;
 const ok = (name, cond, extra = "") => {
   if (!cond) throw new Error(`FAIL: ${name} ${extra}`);
@@ -72,10 +72,10 @@ ok("scan prefix", sc.some((e) => e.key === "k1"));
 // errors: bad token → 401 BunnyError
 let threw = false;
 try {
-  await new BunnyClient(base, "bmdb-cap:AAAA").namespaces();
+  await new BunnyMeshClient(base, "bmdb-cap:AAAA").namespaces();
 } catch (e) {
-  threw = e instanceof BunnyError && e.status === 401;
+  threw = e instanceof BunnyMeshError && e.status === 401;
 }
-ok("bad token → 401 BunnyError", threw);
+ok("bad token → 401 BunnyMeshError", threw);
 
 console.log(`\nPASS all ${pass} assertions`);

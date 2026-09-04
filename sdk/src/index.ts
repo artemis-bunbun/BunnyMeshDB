@@ -1,4 +1,4 @@
-export { BunnyClient, BunnyError, parseJson } from "./client.js";
+export { BunnyMeshClient, BunnyMeshError, parseJson } from "./client.js";
 export { DataClient } from "./data.js";
 export { b64Decode, b64urlEncode, decodeCapToken, decodeUtf8, encodeCapToken, utf8 } from "./encoding.js";
 export type {

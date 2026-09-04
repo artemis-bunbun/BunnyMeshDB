@@ -3,7 +3,7 @@ import { DataClient } from "./data.js";
 import { b64urlEncode, decodeCapToken, encodeCapToken } from "./encoding.js";
 
 /** HTTP error carrying the server's machine-readable `error` string. */
-export class BunnyError extends Error {
+export class BunnyMeshError extends Error {
   constructor(
     public readonly status: number,
     public readonly error: string,
@@ -66,7 +66,7 @@ export async function request<T>(baseUrl: string, init: RequestInit2, parse: (re
   } catch (e) {
     throw new Error(`BunnyMeshDB: cannot reach ${baseUrl} (${(e as Error).message})`);
   }
-  if (!res.ok) throw new BunnyError(res.status, await errorBody(res), init.method, init.path);
+  if (!res.ok) throw new BunnyMeshError(res.status, await errorBody(res), init.method, init.path);
   return parse(res);
 }
 
@@ -80,7 +80,7 @@ function scopeHost(cap: Capability): string {
 
 /** Admin client: L1 control plane (namespaces, capability issuance). The
  * admin token is the `bmdb-cap:…` value printed at daemon startup. */
-export class BunnyClient {
+export class BunnyMeshClient {
   constructor(
     public readonly baseUrl: string,
     public adminToken: string | null = null,
@@ -91,7 +91,7 @@ export class BunnyClient {
   }
 
   private get admin(): string {
-    if (!this.adminToken) throw new Error("no admin capability: pass it to the BunnyClient constructor or setAdminToken()");
+    if (!this.adminToken) throw new Error("no admin capability: pass it to the BunnyMeshClient constructor or setAdminToken()");
     return this.adminToken;
   }
 

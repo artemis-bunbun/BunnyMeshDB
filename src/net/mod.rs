@@ -100,6 +100,9 @@ pub struct SyncEngine {
     pub kp: crate::core::ident::Keypair,
     pub cfg: Arc<Mutex<Config>>,
     pub cfg_path: PathBuf,
+    /// Namespace-change fan-out (SSE push): Some when the daemon serves the
+    /// HTTP events API — mesh-applied writes notify subscribers too.
+    pub change_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Median-of-8 skew samples per peer name.
     skew: HashMap<String, VecDeque<i64>>,
 }
@@ -110,8 +113,9 @@ impl SyncEngine {
         kp: crate::core::ident::Keypair,
         cfg: Arc<Mutex<Config>>,
         cfg_path: PathBuf,
+        change_tx: Option<tokio::sync::broadcast::Sender<String>>,
     ) -> SyncEngine {
-        SyncEngine { store, kp, cfg, cfg_path, skew: HashMap::new() }
+        SyncEngine { store, kp, cfg, cfg_path, change_tx, skew: HashMap::new() }
     }
 
     /// Run the swarm event loop until shutdown. `trigger` fires a sync round
@@ -488,6 +492,11 @@ impl Runner {
                     }
                 }
                 local_seq = store.head(&ns).map(|(s, _)| s).unwrap_or(0);
+                // Fan out to SSE subscribers: mesh-applied writes are change
+                // events too (the local HTTP clients watching this ns).
+                if let Some(tx) = &self.engine.change_tx {
+                    let _ = tx.send(ns.clone());
+                }
             } else {
                 local_seq = 0;
             }

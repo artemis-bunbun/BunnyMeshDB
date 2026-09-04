@@ -82,7 +82,7 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
     let kp = match meta::load(std::path::Path::new(&cfg.node.data_dir)) {
         Ok(kp) => kp,
         Err(e) => {
-            eprintln!("fatal: {e} (run `bunny init <dir>` first, pass its data dir in config)");
+            eprintln!("fatal: {e} (run `bunnymeshdb init <dir>` first, pass its data dir in config)");
             std::process::exit(1);
         }
     };
@@ -135,6 +135,7 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
     // node. Other mesh nodes can still pull from its log via their own
     // engines; this node just never dials or listens on p2p.
     let store_arc: Arc<RwLock<bunnymeshdb::storage::Store>> = Arc::new(RwLock::new(store));
+    let (change_tx, _) = tokio::sync::broadcast::channel::<String>(256);
     let (sync_tx, sync_task);
     if cfg.node.mesh_sync {
         let (tx, rx) = tokio::sync::mpsc::channel::<()>(64);
@@ -144,6 +145,7 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
             kp.clone(),
             sync_cfg,
             config_path,
+            Some(change_tx.clone()),
         );
         let task = tokio::spawn(engine.run(rx, 30));
         sync_tx = Some(tx);
@@ -162,6 +164,7 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
         host_name: cfg.node.name.clone(),
         default_quota: cfg.node.l3.default_quota,
         sync_tx,
+        change_tx: Arc::new(change_tx),
         rev_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         cap_cache: Arc::new(bunnymeshdb::ns::CapCache::new()),
         token_cache: Arc::new(bunnymeshdb::caps::TokenCache::new()),

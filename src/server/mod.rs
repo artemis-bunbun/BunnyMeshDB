@@ -14,6 +14,7 @@ use axum::extract::{Extension, Path, Query as AxumQuery, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -34,6 +35,10 @@ pub struct AppState {
     pub default_quota: u64,
     /// Mesh sync trigger: fired immediately after writes commit.
     pub sync_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Namespace change fan-out for SSE push: every committed write (local
+    /// HTTP or mesh-applied) broadcasts the namespace name. Subscribers
+    /// re-read the log head on delivery.
+    pub change_tx: Arc<tokio::sync::broadcast::Sender<String>>,
     /// Revocation epoch — bumped on every revoke. Cap verify results cached
     /// against this epoch are valid until it changes.
     pub rev_epoch: Arc<std::sync::atomic::AtomicU64>,
@@ -48,6 +53,12 @@ impl AppState {
         if let Some(tx) = &self.sync_tx {
             let _ = tx.try_send(());
         }
+    }
+
+    /// Fan out a namespace-change event to SSE subscribers. Nothing to do —
+    /// the broadcast send is fire-and-forget (no receivers → dropped).
+    fn notify_change(&self, ns: &str) {
+        let _ = self.change_tx.send(ns.to_string());
     }
 }
 
@@ -575,6 +586,7 @@ fn handle_data(
                 Ok(seq) => {
                     drop(store);
                     state.notify_sync();
+                    state.notify_change(&ns);
                     Json(json!({ "ok": true, "seq": seq, "expires_at": expires_at })).into_response()
                 }
                 Err(e) => {
@@ -594,6 +606,7 @@ fn handle_data(
                 Ok(_) => {
                     drop(store);
                     state.notify_sync();
+                    state.notify_change(&ns);
                     Json(json!({ "ok": true })).into_response()
                 }
                 Err(e) => {
@@ -827,6 +840,63 @@ async fn l3_conflicts(
     Json(json!({ "conflicts": out })).into_response()
 }
 
+// ---------- SSE change push ----------
+
+/// GET /l2/{ns}/events — Server-Sent Events: emits one `change` event per
+/// committed write to the namespace (local HTTP or mesh-applied). Each
+/// payload is the log head at delivery time; the subscriber replays the
+/// delta via `changes?since=<head.seq>`. First connect emits nothing until
+/// the next write — seed read state with `head`/`changes` first.
+async fn l2_events(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+) -> Response {
+    match data_auth(&state, caps.as_ref(), &ns, "") {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    sse_events(state, ns)
+}
+
+async fn l3_events(
+    State(state): State<AppState>,
+    Extension(_caps): Extension<Option<AuthCaps>>,
+    Path(pk): Path<String>,
+) -> Response {
+    let ns = format!("u/{pk}");
+    match data_auth(&state, None, &ns, "") {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    sse_events(state, ns)
+}
+
+/// The event stream: subscribe to the namespace broadcast, emit the current
+/// log head on every event for this namespace, stay connected until the
+/// broadcast channel closes (daemon shutdown).
+fn sse_events(state: AppState, ns: String) -> Response {
+    let mut rx = state.change_tx.subscribe();
+    let store = state.store.clone();
+    let stream = futures::stream::unfold((rx, store, ns.clone()), |(mut rx, store, ns)| async move {
+        loop {
+            match rx.recv().await {
+                Ok(ev_ns) if ev_ns == ns => {
+                    let payload = match store.read().head(&ns) {
+                        Some((seq, h)) => json!({ "ns": ns, "seq": seq, "hash": hex::encode(&h) }),
+                        None => json!({ "ns": ns, "seq": 0 }),
+                    };
+                    let ev = Event::default().event("change").json_data(payload).unwrap_or_default();
+                    return Some((Ok::<_, std::convert::Infallible>(ev), (rx, store, ns)));
+                }
+                Ok(_) => continue,
+                Err(_) => return None, // channel closed → end the stream
+            }
+        }
+    });
+    Sse::new(stream).keep_alive(KeepAlive::new()).into_response()
+}
+
 // ---------- router ----------
 
 pub fn app(state: AppState) -> Router {
@@ -846,6 +916,8 @@ pub fn app(state: AppState) -> Router {
         .route("/l3/u/{pk}/changes", get(l3_changes))
         .route("/l2/{ns}/conflicts", get(l2_conflicts))
         .route("/l3/u/{pk}/conflicts", get(l3_conflicts))
+        .route("/l2/{ns}/events", get(l2_events))
+        .route("/l3/u/{pk}/events", get(l3_events))
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .with_state(state.clone());
     Router::new()

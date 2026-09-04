@@ -126,13 +126,17 @@ record format or the sync protocol.
   lowest-seq-first stream of durable log records (PUT/DEL/TTL), plus the
   namespace `head`; `GET /l2/{ns}/head` returns `{seq, hash}` for cheap
   long-poll. Poll with `since` = previous `head.seq`.
+- **Real-time push (SSE)** — `GET /l2/{ns}/events` streams a Server-Sent
+  event per committed write (local HTTP *or* mesh-applied), each carrying
+  the log head at delivery; the client replays the delta via the change
+  feed. Turns the poll feed into a subscription.
 - **Conflict observability** — register-policy namespaces keep every
   concurrent version. `GET /l2/{ns}/{key}?versions=true` exposes them raw;
   `GET /l2/{ns}/conflicts` lists every key holding >1 version. This turns
   divergent-history CRDT data into something a client can see and reconcile.
-- **Backup / restore** — `bunny backup <data> --out <dir>` checkpoints the
+- **Backup / restore** — `bunnymeshdb backup <data> --out <dir>` checkpoints the
   store then copies the data dir (root private key written 0600);
-  `bunny restore <backup> --data-dir <dir>` copies it back into a fresh
+  `bunnymeshdb restore <backup> --data-dir <dir>` copies it back into a fresh
   node dir. Byte-identical `meta.bin` ⇒ restored node keeps its identity.
 - Known quirk: data routes require a cap carrying `read|write` regardless of
   method (pre-existing; a read-only cap cannot GET). Not part of this

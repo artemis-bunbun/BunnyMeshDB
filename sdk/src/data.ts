@@ -1,4 +1,4 @@
-import { BunnyError, parseJson, request } from "./client.js";
+import { BunnyMeshError, parseJson, request } from "./client.js";
 import { b64Decode, decodeUtf8, utf8 } from "./encoding.js";
 import type { Change, ChangesResponse, ConflictEntry, Head, PutResult, ScanEntry, VersionInfo } from "./types.js";
 
@@ -58,7 +58,7 @@ export class DataClient {
     try {
       return await this.req("GET", `/${encodeURIComponent(key)}`, {}, DataClient.rawBytes);
     } catch (e) {
-      if (e instanceof BunnyError && e.status === 404) return null;
+      if (e instanceof BunnyMeshError && e.status === 404) return null;
       throw e;
     }
   }
@@ -108,7 +108,7 @@ export class DataClient {
     try {
       return await this.req("GET", "/head", {}, DataClient.parsed(DataClient.parseHead));
     } catch (e) {
-      if (e instanceof BunnyError && e.status === 404) return null;
+      if (e instanceof BunnyMeshError && e.status === 404) return null;
       throw e;
     }
   }
@@ -145,6 +145,54 @@ export class DataClient {
         versions: Array.isArray(c.versions) ? (c.versions as Record<string, unknown>[]).map(DataClient.readVersion) : [],
       })) : [];
     }));
+  }
+
+  /** Subscribe to live change events (SSE push, `GET /events`).
+   *
+   * `onEvent` fires once per committed write to this namespace (local HTTP
+   * or mesh-applied); each event carries the log head at delivery — replay
+   * the delta with `changes(since)` seeded from `head.seq`. Resolves when
+   * the stream ends (daemon shutdown or `signal` abort).
+   */
+  async subscribe(
+    onEvent: (ev: { ns: string; seq: number; hash: string }) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const url = `${this.baseUrl}${this.base}/events`;
+    const headers: Record<string, string> = {};
+    if (this.token) headers.Authorization = `Bearer ${this.token}`;
+    let res: Response;
+    try {
+      res = await fetch(url, { headers, signal });
+    } catch (e) {
+      throw new Error(`BunnyMeshDB: cannot reach ${this.baseUrl} (${(e as Error).message})`);
+    }
+    if (!res.ok) {
+      const text = await res.text().catch(() => res.statusText);
+      throw new BunnyMeshError(res.status, text, "GET", `${this.base}/events`);
+    }
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error("BunnyMeshDB: no response body for events stream");
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx: number;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const dataLine = frame.split("\n").find((l) => l.startsWith("data: "));
+        if (dataLine) {
+          try {
+            onEvent(JSON.parse(dataLine.slice(6)) as { ns: string; seq: number; hash: string });
+          } catch {
+            // malformed frame — skip
+          }
+        }
+      }
+    }
   }
 
   /** Run a query-DSL expression in this namespace. */

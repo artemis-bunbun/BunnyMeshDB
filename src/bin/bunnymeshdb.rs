@@ -1,4 +1,4 @@
-//! `bunny` — the user-facing CLI: init a node directory, or run a REPL
+//! `bunnymeshdb` — the user-facing CLI: init a node directory, or run a REPL
 //! against a data dir.
 
 use bunnymeshdb::core::meta;
@@ -50,7 +50,7 @@ fn copy_file(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 #[derive(Parser)]
-#[command(name = "bunny", about = "BunnyMeshDB CLI")]
+#[command(name = "bunnymeshdb", about = "BunnyMeshDB CLI")]
 struct Cli {
     #[command(subcommand)]
     cmd: Commands,
@@ -86,7 +86,7 @@ enum Commands {
     },
     /// Restore a previously-taken backup back into a node data dir.
     Restore {
-        /// Backup directory produced by `bunny backup`.
+        /// Backup directory produced by `bunnymeshdb backup`.
         backup: PathBuf,
         /// Target data dir (must not already contain a node).
         #[arg(long)]

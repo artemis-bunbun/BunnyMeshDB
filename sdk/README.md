@@ -18,11 +18,11 @@ npm install bunnymeshdb
 ## Quickstart
 
 ```ts
-import { BunnyClient } from "bunnymeshdb";
+import { BunnyMeshClient } from "bunnymeshdb";
 
 // The admin capability is printed at daemon startup:
 //   INFO bunnymeshdbd: admin cap: bmdb-cap:eyJzY29wZSI6…
-const client = new BunnyClient("http://127.0.0.1:8853", "bmdb-cap:eyJzY29wZSI6…");
+const client = new BunnyMeshClient("http://127.0.0.1:8853", "bmdb-cap:eyJzY29wZSI6…");
 
 await client.createNamespace("notes", "register");
 
@@ -47,7 +47,7 @@ for (const c of changes) console.log(c.seq, c.key, c.del ? "del" : "put");
 
 ## API
 
-### `BunnyClient(baseUrl, adminToken?)`
+### `BunnyMeshClient(baseUrl, adminToken?)`
 | method | description |
 |---|---|
 | `health()` | `GET /healthz` |
@@ -70,10 +70,11 @@ for (const c of changes) console.log(c.seq, c.key, c.del ? "del" : "put");
 | `versions(key)` | every retained version (`?versions=true`) |
 | `head()` | `{seq, hash}` — cheap poll point |
 | `changes(since?)` | gapless `{since, head, changes[]}` stream |
+| `subscribe(onEvent, signal?)` | live SSE push — one event per write, carrying the log head |
 | `conflicts()` | register-policy keys with >1 divergent version |
 | `ql(expr)` | query-DSL expression |
 
-Errors: failed HTTP → `BunnyError` (`status` + machine-readable `error`).
+Errors: failed HTTP → `BunnyMeshError` (`status` + machine-readable `error`).
 `get`/`head` return `null` on 404; everything else throws.
 
 ## Notes & quirks
