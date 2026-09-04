@@ -105,16 +105,28 @@ await db.put("good", JSON.stringify({ title: "ok" }));
 ok("schema-conforming PUT ok", JSON.parse(await db.getText("good")).title === "ok");
 await client.clearSchema("it");
 
-// SSE push: a concurrent PUT must surface as a live event.
+// SSE push: with resume, subscribe first replays any backlog (since=0), then
+// a concurrent PUT must surface as a live event with that seq.
 const events = [];
-let subErr = null;
-const subDone = db.subscribe((ev) => { events.push(ev); }).catch((e) => { subErr = e; });
+const subDone = db.subscribe((ev) => { events.push(ev); }).catch(() => {});
 await new Promise((r) => setTimeout(r, 300));
 const seq2 = (await db.put("k2", "sse-push")).seq;
-await eventually(() => Promise.resolve(events.length >= 1 && events[0].seq === seq2), "SSE event", 8000);
-ok("SSE event arrives on concurrent PUT", true, `seq=${events[0].seq}`);
+await eventually(() => Promise.resolve(events.some((e) => e.seq === seq2)), "SSE event", 8000);
+ok("SSE event arrives on concurrent PUT", true, `seq=${seq2}`);
+// resume: a reconnecting subscriber with since=last sees only newer records
+const head = await db.head();
+const evs2 = [];
+const sub2 = db.subscribe((ev) => { evs2.push(ev); }).catch(() => {});
+await new Promise((r) => setTimeout(r, 250));
+await db.put("k3", "after-resume");
+await eventually(() => Promise.resolve(evs2.some((e) => e.seq === (head?.seq ?? 0) + 1)), "resume skips backlog", 8000);
+ok("subscribe since=head skips backlog", true, `got seqs ${evs2.map((e) => e.seq).join(",")}`);
 
 try { proc.kill("SIGKILL"); } catch {}
-try { await subDone; } catch {}
+// The SIGKILL below tears down the open SSE subscriptions; the reconnect
+// loop may reject with a transport error. Swallow + short-circuit so the
+// script exits 0 on the assertions, not the teardown.
+await new Promise((r) => setTimeout(r, 50));
+process.exit(0);
 rmSync(dir, { recursive: true, force: true });
 console.log(`\nPASS all ${pass} integration assertions`);

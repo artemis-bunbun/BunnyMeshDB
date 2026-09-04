@@ -262,10 +262,18 @@ pub struct Store {
     meta: BTreeMap<String, Vec<u8>>,
     peer_clocks: BTreeMap<String, i64>,
     revision: u64,
+    /// When true, every log append is fsynced (durable writes). Config-driven.
+    durable: bool,
 }
 
 impl Store {
     pub fn open(dir: &Path) -> Result<Store, StorageError> {
+        Self::open_durable(dir, false)
+    }
+
+    /// Open a store; when `durable`, every log append is fsynced (config:
+    /// `node.durable_writes`). Default false (fast path).
+    pub fn open_durable(dir: &Path, durable: bool) -> Result<Store, StorageError> {
         std::fs::create_dir_all(dir)?;
         let snap_bytes = match std::fs::read(dir.join("index.snap")) {
             Ok(b) => Some(b),
@@ -282,6 +290,7 @@ impl Store {
             meta: BTreeMap::new(),
             peer_clocks: BTreeMap::new(),
             revision: 0,
+            durable,
         };
         // (ns → (seq, hash)) as of the snapshot.
         let mut snap_info: BTreeMap<Namespace, (u64, [u8; 32])> = BTreeMap::new();
@@ -316,7 +325,7 @@ impl Store {
         }
 
         for ns in ns_names {
-            let (log, warn) = Log::recover(&ns_dir(dir, &ns))?;
+            let (log, warn) = Log::recover_durable(&ns_dir(dir, &ns), durable)?;
             if let Some(RecoverWarning::TruncatedTail { records_dropped }) = warn {
                 tracing::warn!(ns = %ns, records_dropped, "log tail truncated during recovery");
             }
@@ -481,7 +490,7 @@ impl Store {
         if self.policies.contains_key(ns) {
             return Err(StorageError::NamespaceExists(ns.to_string()));
         }
-        let log = Log::open(&self.dir, ns)?;
+        let log = Log::open_durable(&self.dir, ns, self.durable)?;
         let sidecar = ns_dir(&self.dir, ns).join(POLICY_SIDECAR);
         let mut f = OpenOptions::new().create_new(true).write(true).open(&sidecar)?;
         f.write_all(&[policy_to_u8(policy)])?;
@@ -911,6 +920,146 @@ impl Store {
     pub fn peer_clock(&self, name: &str) -> Option<i64> {
         self.peer_clocks.get(name).copied()
     }
+
+    /// In-place compaction for a running daemon (no reopen). Refuses a
+    /// mesh-synced node: the append-log is the replication dedupe key, so
+    /// reclaiming a record a peer could re-send risks re-applying a stale
+    /// tombstone. Caller holds the write lock. Drops superseded versions and
+    /// expired TTL rows, restarts seq at 1, checkpoints base-0 snapshots.
+    /// Returns bytes reclaimed (best-effort).
+    pub fn gc_live(&mut self) -> Result<u64, StorageError> {
+        if !self.peer_clocks.is_empty() {
+            return Err(StorageError::Io(format!(
+                "refusing to compact: node has mesh-synced peers ({} recorded); compaction is only safe standalone",
+                self.peer_clocks.len()
+            )));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut reclaimed = 0u64;
+        let nss: Vec<String> = self.namespaces().iter().map(|(n, _)| n.clone()).collect();
+        for ns in nss {
+            let d = ns_dir(&self.dir, &ns);
+            let mut before = 0u64;
+            let mut i = 0u32;
+            loop {
+                match std::fs::metadata(d.join(format!("log.{i}.seg"))) {
+                    Ok(m) => before += m.len(),
+                    Err(_) => break,
+                }
+                i += 1;
+            }
+            let mut out: Vec<crate::storage::log::Record> = Vec::new();
+            for (k, e) in self.scan(&ns, b"") {
+                match e {
+                    Entry::Lww(v) => {
+                        if v.expires_at != 0 && v.expires_at <= now {
+                            continue;
+                        }
+                        out.push(crate::storage::log::Record {
+                            tag: if v.expires_at == 0 { TAG_PUT } else { TAG_PUT_TTL },
+                            key: k.clone(),
+                            hlc: v.hlc,
+                            replica: v.replica,
+                            author: v.author,
+                            value: v.value.clone(),
+                            expires_at: v.expires_at,
+                        });
+                    }
+                    Entry::Register(vs) => {
+                        for v in vs {
+                            if v.expires_at != 0 && v.expires_at <= now {
+                                continue;
+                            }
+                            out.push(crate::storage::log::Record {
+                                tag: if v.expires_at == 0 { TAG_PUT } else { TAG_PUT_TTL },
+                                key: k.clone(),
+                                hlc: v.hlc,
+                                replica: v.replica,
+                                author: v.author,
+                                value: v.value.clone(),
+                                expires_at: v.expires_at,
+                            });
+                        }
+                    }
+                }
+            }
+            for ((n, k), hlc) in self.tombs.iter() {
+                if n != &ns {
+                    continue;
+                }
+                let ek = (ns.to_string(), k.clone());
+                if self.index.contains_key(&ek) {
+                    continue;
+                }
+                out.push(crate::storage::log::Record {
+                    tag: TAG_DEL,
+                    key: k.clone(),
+                    hlc: *hlc,
+                    replica: [0u8; 32],
+                    author: [0u8; 32],
+                    value: Vec::new(),
+                    expires_at: 0,
+                });
+            }
+            if !out.is_empty() {
+                let d = ns_dir(&self.dir, &ns);
+                crate::storage::log::Log::write_fresh(&d, &out)?;
+                // Reopen the fresh log so in-memory seq/head/offsets match,
+                // then rebuild this namespace's index + tombs from the fresh
+                // records (the old index still holds superseded/expired
+                // entries we just compacted away).
+                let fresh = crate::storage::log::Log::open_durable(&self.dir, &ns, self.durable)?;
+                self.logs.insert(ns.clone(), fresh);
+                // Drop this ns's entries from the live index/tombs.
+                let mut keep_idx: Vec<(Namespace, Key, Entry)> = Vec::new();
+                for ((n, k), e) in self.index.iter() {
+                    if *n != ns {
+                        keep_idx.push((n.clone(), k.clone(), e.clone()));
+                    }
+                }
+                self.index.clear();
+                for (n, k, e) in keep_idx {
+                    self.index.insert((n, k), e);
+                }
+                let mut keep_tombs: Vec<(Namespace, Key, u64)> = Vec::new();
+                for ((n, k), h) in self.tombs.iter() {
+                    if *n != ns {
+                        keep_tombs.push((n.clone(), k.clone(), *h));
+                    }
+                }
+                self.tombs.clear();
+                for (n, k, h) in keep_tombs {
+                    self.tombs.insert((n, k), h);
+                }
+                // Re-apply the fresh records to rebuild this ns's state.
+                let recs = self.log_records(&ns, 1).unwrap_or_default();
+                for (seq, bytes) in recs {
+                    match crate::storage::log::Record::parse_chain(&bytes, None) {
+                        Ok((record, _)) => {
+                            self.apply_record(&ns, &record, seq)?;
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            // reclaim: (before - fresh size); skip empty-ns arithmetic.
+            let mut after = 0u64;
+            let mut j = 0u32;
+            loop {
+                match std::fs::metadata(d.join(format!("log.{j}.seg"))) {
+                    Ok(m) => after += m.len(),
+                    Err(_) => break,
+                }
+                j += 1;
+            }
+            reclaimed = reclaimed.saturating_add(before.saturating_sub(after));
+        }
+        self.checkpoint()?;
+        Ok(reclaimed)
+    }
 }
 
 /// Offline log compaction + TTL GC for a standalone node.
@@ -1166,7 +1315,7 @@ mod tests {
         let nd = ns_dir(&dir, "n");
         assert!(std::fs::metadata(nd.join("log.0.seg")).is_ok());
         assert!(std::fs::metadata(nd.join("log.1.seg")).is_err());
-        let mut s = Store::open(&dir).unwrap();
+        let s = Store::open(&dir).unwrap();
         // Live LWW value retained (superseded "fresh" gone).
         match s.get("n", &b"k1".to_vec()).unwrap() {
             Entry::Lww(v) => assert_eq!(v.value, b"newer"),
@@ -1188,6 +1337,39 @@ mod tests {
         // Policy survived.
         assert_eq!(s.policy("n"), Some(ConflictPolicy::Lww));
         let _ = reclaimed;
+    }
+
+    #[test]
+    fn gc_live_compacts_standalone_store_in_place() {
+        let dir = tmpdir("gc-live");
+        let mut s = Store::open(&dir).unwrap();
+        s.create_namespace("n", ConflictPolicy::Lww).unwrap();
+        seed(&mut s, "n", "k", "v1", 100);
+        seed(&mut s, "n", "k", "v2", 200); // supersedes v1
+        s.put("n", &b"tmp".to_vec(), b"exp", 300, REP, AUTH, 1).unwrap(); // expired
+        s.put("n", &b"live".to_vec(), b"keep", 400, REP, AUTH, i64::MAX as u64).unwrap();
+        // No checkpoint yet — everything in the log.
+        let reclaimed = s.gc_live().unwrap();
+        let _ = reclaimed;
+        // Reads reflect the compacted state, from the fresh in-memory log.
+        match s.get("n", &b"k".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.value, b"v2"),
+            _ => panic!("expected Lww"),
+        }
+        assert_eq!(s.get("n", &b"tmp".to_vec()), None); // expired dropped
+        match s.get("n", &b"live".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.value, b"keep"),
+            _ => panic!("expected Lww"),
+        }
+        // Seq restarted small — only live + tombstone records remain.
+        let recs = s.log_records("n", 1).unwrap();
+        assert!(recs.len() <= 2);
+        // A fresh reopen also sees the compacted state (durable).
+        let s2 = Store::open(&dir).unwrap();
+        match s2.get("n", &b"k".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.value, b"v2"),
+            _ => panic!("expected Lww after reopen"),
+        }
     }
 
     #[test]

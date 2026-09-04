@@ -148,57 +148,81 @@ export class DataClient {
     }));
   }
 
-  /** Subscribe to live change events (SSE push, `GET /events`).
+  /** Subscribe to live change events (SSE push, `GET /events?since=`).
    *
    * `onEvent` fires once per committed write to this namespace (local HTTP
-   * or mesh-applied); each event carries the log head at delivery — replay
-   * the delta with `changes(since)` seeded from `head.seq`. Resolves when
-   * the stream ends (daemon shutdown or `signal` abort).
+   * or mesh-applied), in log order, each carrying `{ns, seq, hash}` (the
+   * per-record log head — `seq` is a gapless cursor). Auto-resumes: on a
+   * dropped connection it reconnects with `since = last seen seq` and
+   * exponential backoff, so no committed write is missed. Resolves only when
+   * `signal` aborts (or the daemon stays down and `signal` is never set).
    */
   async subscribe(
     onEvent: (ev: { ns: string; seq: number; hash: string }) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    const url = `${this.baseUrl}${this.base}/events`;
-    const headers: Record<string, string> = {};
-    if (this.token) headers.Authorization = `Bearer ${this.token}`;
-    let res: Response;
-    try {
-      res = await fetch(url, { headers, signal });
-    } catch (e) {
-      throw new Error(`BunnyMeshDB: cannot reach ${this.baseUrl} (${(e as Error).message})`);
-    }
-    if (!res.ok) {
-      const text = await res.text().catch(() => res.statusText);
-      throw new BunnyMeshError(res.status, text, "GET", `${this.base}/events`);
-    }
-    const body = res.body;
-    if (typeof body?.getReader !== "function") {
-      throw new Error(
-        "BunnyMeshDB: live push needs a ReadableStream-capable fetch (unavailable on this React Native runtime). " +
-          "Fall back to changes(since) polling for real-time on RN.",
-      );
-    }
-    const reader = body.getReader();
-    const decoder = new StreamUtf8();
-    let buf = "";
+    let since = 0;
+    let attempt = 0;
     for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.feed(value);
-      let idx: number;
-      while ((idx = buf.indexOf("\n\n")) !== -1) {
-        const frame = buf.slice(0, idx);
-        buf = buf.slice(idx + 2);
-        const dataLine = frame.split("\n").find((l) => l.startsWith("data: "));
-        if (dataLine) {
-          try {
-            onEvent(JSON.parse(dataLine.slice(6)) as { ns: string; seq: number; hash: string });
-          } catch {
-            // malformed frame — skip
+      if (signal?.aborted) return;
+      const url = `${this.baseUrl}${this.base}/events?since=${since}`;
+      const headers: Record<string, string> = {};
+      if (this.token) headers.Authorization = `Bearer ${this.token}`;
+      let res: Response;
+      try {
+        res = await fetch(url, { headers, signal });
+      } catch (e) {
+        if (signal?.aborted) return;
+        throw new Error(`BunnyMeshDB: cannot reach ${this.baseUrl} (${(e as Error).message})`);
+      }
+      if (!res.ok) {
+        const text = await res.text().catch(() => res.statusText);
+        throw new BunnyMeshError(res.status, text, "GET", `${this.base}/events`);
+      }
+      const body = res.body;
+      if (typeof body?.getReader !== "function") {
+        throw new Error(
+          "BunnyMeshDB: live push needs a ReadableStream-capable fetch (unavailable on this React Native runtime). " +
+            "Fall back to changes(since) polling for real-time on RN.",
+        );
+      }
+      const reader = body.getReader();
+      const decoder = new StreamUtf8();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.feed(value);
+        let idx: number;
+        while ((idx = buf.indexOf("\n\n")) !== -1) {
+          const frame = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          let dataLine: string | null = null;
+          let id: string | null = null;
+          for (const l of frame.split("\n")) {
+            if (l.startsWith("data: ")) dataLine = l.slice(6);
+            else if (l.startsWith("id:")) id = l.slice(3).trim();
+          }
+          if (dataLine) {
+            let ev: { ns?: string; seq?: unknown; hash?: unknown };
+            try {
+              ev = JSON.parse(dataLine);
+            } catch {
+              continue;
+            }
+            if (typeof ev.seq === "number" && Number.isSafeInteger(ev.seq)) since = ev.seq;
+            else if (id !== null && /^\d+$/.test(id)) since = Number(id);
+            onEvent(ev as { ns: string; seq: number; hash: string });
           }
         }
+        if (signal?.aborted) return;
       }
+      // Stream ended (daemon restart / network drop). Backoff + reconnect,
+      // resuming from the last seen seq so nothing is missed.
+      if (signal?.aborted) return;
+      attempt++;
+      const delay = Math.min(1000 * Math.pow(2, Math.min(attempt, 5)), 30000);
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
 

@@ -36,9 +36,21 @@ binaries for x86_64 and aarch64.
   DSL, schema admin, capability issuance.
 
 ### Operations
-- `bunnymeshdb` CLI: init, backup, restore, repl, peers.
+- `bunnymeshdb` CLI: init, backup, restore, repl, peers, compact.
 - `bunnymeshdbd serve` self-initializes an uninitialized data dir (refuses to
   touch a corrupt one).
+- **SSE change push with resume**: `GET /l2/{ns}/events?since=<seq>` replays
+  the backlog then pushes live events, each tagged `id: <seq>`; the SDK
+  auto-reconnects with backoff from the last seen seq, so no write is missed
+  across a dropped connection.
+- **Durable writes**: `node.durable_writes` (default false) fsyncs every
+  append before acknowledging — the durability toggle for the no-per-record-
+  fsync fast path.
+- **Metrics**: `GET /metrics` — requests, writes, namespaces (lock-free).
+- **Auto-compact/TTL GC**: `node.gc_interval_secs` runs log compaction +
+  expiry GC on a live daemon for standalone nodes (same safety guard as the
+  CLI). Online mesh-node compaction deliberately deferred — it needs protocol
+  fencing so a peer can't re-send a compacted record.
 - TLS termination via tokio-rustls.
 
 ### Not yet (tracked)

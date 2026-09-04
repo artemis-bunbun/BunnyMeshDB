@@ -229,6 +229,10 @@ pub struct Log {
     /// Logical start offset of each record (prefix-sum position in the
     /// merged byte stream), seq is 1-based → offsets[seq-1].
     offsets: Vec<u64>,
+    /// When true, every append is fsynced before returning (durability at
+    /// the cost of writes-per-second). Default false (fast path: a crash can
+    /// lose the single in-flight record).
+    durable: bool,
 }
 
 fn seg_path(dir: &Path, seg: u32) -> PathBuf {
@@ -238,9 +242,14 @@ fn seg_path(dir: &Path, seg: u32) -> PathBuf {
 impl Log {
     /// Open (creating if needed) the log rooted at `data/<root>/<ns_hex>/`.
     pub fn open(root: &Path, ns: &str) -> Result<Log, StorageError> {
+        Self::open_durable(root, ns, false)
+    }
+
+    /// Open a log, optionally fsyncing every append (`durable`).
+    pub fn open_durable(root: &Path, ns: &str, durable: bool) -> Result<Log, StorageError> {
         let dir = ns_dir(&root.to_path_buf(), &ns.to_string());
         std::fs::create_dir_all(&dir)?;
-        let (log, _warn) = Log::recover(&dir)?;
+        let (log, _warn) = Log::recover_durable(&dir, durable)?;
         Ok(log)
     }
 
@@ -254,6 +263,11 @@ impl Log {
     /// - any other failure (earlier segment, or data present after the bad
     ///   record) → `StorageError::Corrupt`.
     pub fn recover(dir: &Path) -> Result<(Log, Option<RecoverWarning>), StorageError> {
+        Self::recover_durable(dir, false)
+    }
+
+    /// Recover a log, optionally fsyncing every append (`durable`).
+    pub fn recover_durable(dir: &Path, durable: bool) -> Result<(Log, Option<RecoverWarning>), StorageError> {
         // Discover contiguous segments log.0..log.N.
         let mut segs: Vec<(u32, u64)> = Vec::new();
         let mut i = 0u32;
@@ -377,6 +391,7 @@ impl Log {
                 seq,
                 head,
                 offsets,
+                durable,
             },
             warning,
         ))
@@ -402,6 +417,9 @@ impl Log {
         // last entry, so the sum is the current file end).
         let off = self.seg_lens.iter().map(|(_, l)| *l).sum::<u64>();
         self.cur.write_all(bytes)?;
+        if self.durable {
+            self.cur.sync_all()?;
+        }
         self.cur_len += bytes.len() as u64;
         if let Some(last) = self.seg_lens.last_mut() {
             last.1 = self.cur_len;

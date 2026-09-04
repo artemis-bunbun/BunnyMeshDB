@@ -47,6 +47,8 @@ pub struct AppState {
     pub cap_cache: Arc<CapCache>,
     /// token digest → parsed capability (content-addressed parse cache).
     pub token_cache: Arc<TokenCache>,
+    /// Runtime counters for `/metrics`.
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -69,6 +71,30 @@ impl AppState {
 /// per-request deep clone of the whole capability (its strings/arrays).
 #[derive(Clone)]
 pub struct AuthCaps(pub Vec<Arc<Capability>>);
+
+/// Lightweight, lock-free runtime counters for `/metrics`.
+#[derive(Clone)]
+pub struct Metrics {
+    pub requests: Arc<std::sync::atomic::AtomicU64>,
+    pub writes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Metrics {
+    pub fn new() -> Metrics {
+        Metrics {
+            requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn bump_requests(&self) {
+        self.requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn bump_writes(&self) {
+        self.writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 // ---------- responses ----------
 
@@ -97,6 +123,7 @@ pub async fn auth_mw(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
+    state.metrics.bump_requests();
     let header = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     match header {
         None => {
@@ -252,6 +279,19 @@ async fn healthz() -> Json<JValue> {
     Json(json!({ "ok": true }))
 }
 
+/// GET /metrics — open runtime counters (requests, writes, live namespaces).
+async fn metrics(
+    State(state): State<AppState>,
+) -> Json<JValue> {
+    let store = state.store.read();
+    let nss = store.namespaces();
+    Json(json!({
+        "requests": state.metrics.requests.load(std::sync::atomic::Ordering::Relaxed),
+        "writes": state.metrics.writes.load(std::sync::atomic::Ordering::Relaxed),
+        "namespaces": nss.len(),
+    }))
+}
+
 #[derive(Deserialize)]
 struct CreateNsBody {
     name: String,
@@ -372,7 +412,8 @@ async fn l1_schema_set(
         Ok(seq) => {
             drop(store);
             state.notify_sync();
-            state.notify_change(&ns);
+            state.metrics.bump_writes();
+                    state.notify_change(&ns);
             Json(json!({ "ok": true, "seq": seq })).into_response()
         }
         Err(e) => {
@@ -402,7 +443,8 @@ async fn l1_schema_clear(
         Ok(seq) => {
             drop(store);
             state.notify_sync();
-            state.notify_change(&ns);
+            state.metrics.bump_writes();
+                    state.notify_change(&ns);
             Json(json!({ "ok": true, "seq": seq })).into_response()
         }
         Err(e) => {
@@ -699,6 +741,7 @@ fn handle_data(
                 Ok(seq) => {
                     drop(store);
                     state.notify_sync();
+                    state.metrics.bump_writes();
                     state.notify_change(&ns);
                     Json(json!({ "ok": true, "seq": seq, "expires_at": expires_at })).into_response()
                 }
@@ -719,6 +762,7 @@ fn handle_data(
                 Ok(_) => {
                     drop(store);
                     state.notify_sync();
+                    state.metrics.bump_writes();
                     state.notify_change(&ns);
                     Json(json!({ "ok": true })).into_response()
                 }
@@ -964,44 +1008,67 @@ async fn l2_events(
     State(state): State<AppState>,
     Extension(caps): Extension<Option<AuthCaps>>,
     Path(ns): Path<String>,
+    query: AxumQuery<HashMap<String, String>>,
 ) -> Response {
     match data_auth(&state, caps.as_ref(), &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
-    sse_events(state, ns)
+    let since = query.0.get("since").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    sse_events(state, ns, since)
 }
 
 async fn l3_events(
     State(state): State<AppState>,
     Extension(_caps): Extension<Option<AuthCaps>>,
     Path(pk): Path<String>,
+    query: AxumQuery<HashMap<String, String>>,
 ) -> Response {
     let ns = format!("u/{pk}");
     match data_auth(&state, None, &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
-    sse_events(state, ns)
+    let since = query.0.get("since").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    sse_events(state, ns, since)
 }
 
-/// The event stream: subscribe to the namespace broadcast, emit the current
-/// log head on every event for this namespace, stay connected until the
+/// The event stream with resume. On connect, replays every record after
+/// `since` from the durable log as one `change` event per record (each with
+/// `id: <seq>` — gapless, so a reconnecting client passes `since` = last seen
+/// id and misses nothing). Then subscribes to the namespace broadcast: every
+/// committed write (local HTTP or mesh-applied) broadcasts, waking this
+/// stream to drain whatever new records exist. Stays connected until the
 /// broadcast channel closes (daemon shutdown).
-fn sse_events(state: AppState, ns: String) -> Response {
+fn sse_events(state: AppState, ns: String, since: u64) -> Response {
     let rx = state.change_tx.subscribe();
     let store = state.store.clone();
-    let stream = futures::stream::unfold((rx, store, ns.clone()), |(mut rx, store, ns)| async move {
+    let stream = futures::stream::unfold((rx, store, ns.clone(), since), |(mut rx, store, ns, cursor)| async move {
+        let cur = cursor;
         loop {
+            // Drain at most one record from the durable log (cursor+1); copy
+            // it out so refs don't dangle after the log snapshot drops.
+            let recs = store.read().log_records(&ns, cur + 1).unwrap_or_default();
+            let first_seq = recs.first().map(|(s, _)| *s);
+            let first_bytes = recs.first().map(|(_, b)| b.to_vec());
+            if let Some(seq) = first_seq {
+                let bytes = first_bytes.unwrap();
+                let (_, prev) = match crate::storage::log::Record::parse_chain(&bytes, None) {
+                    Ok(p) => p,
+                    Err(_) => (crate::storage::log::Record { tag: crate::storage::log::TAG_DEL, key: Vec::new(), hlc: 0, replica: [0u8; 32], author: [0u8; 32], value: Vec::new(), expires_at: 0 }, [0u8; 32]),
+                };
+                let hash = crate::storage::log::Record::record_hash(&prev, &bytes);
+                let payload = json!({ "ns": ns, "seq": seq, "hash": hex::encode(&hash) });
+                let ev = Event::default()
+                    .id(seq.to_string().as_str())
+                    .event("change")
+                    .json_data(payload)
+                    .unwrap_or_default();
+                return Some((Ok::<_, std::convert::Infallible>(ev), (rx, store, ns, seq)));
+            }
+            // Caught up: wait for the next write to this namespace.
             match rx.recv().await {
-                Ok(ev_ns) if ev_ns == ns => {
-                    let payload = match store.read().head(&ns) {
-                        Some((seq, h)) => json!({ "ns": ns, "seq": seq, "hash": hex::encode(&h) }),
-                        None => json!({ "ns": ns, "seq": 0 }),
-                    };
-                    let ev = Event::default().event("change").json_data(payload).unwrap_or_default();
-                    return Some((Ok::<_, std::convert::Infallible>(ev), (rx, store, ns)));
-                }
+                Ok(ev_ns) if ev_ns == ns => continue, // loop back to drain
                 Ok(_) => continue,
                 Err(_) => return None, // channel closed → end the stream
             }
@@ -1036,6 +1103,7 @@ pub fn app(state: AppState) -> Router {
         .with_state(state.clone());
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .merge(protected)
         .with_state(state)
 }

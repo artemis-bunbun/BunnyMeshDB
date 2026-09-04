@@ -102,7 +102,7 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
         }
     };
     let root = kp.public();
-    let mut store = match Store::open(std::path::Path::new(&cfg.node.data_dir)) {
+    let mut store = match Store::open_durable(std::path::Path::new(&cfg.node.data_dir), cfg.node.durable_writes) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("fatal: open store: {e}");
@@ -183,6 +183,7 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
         rev_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         cap_cache: Arc::new(bunnymeshdb::ns::CapCache::new()),
         token_cache: Arc::new(bunnymeshdb::caps::TokenCache::new()),
+        metrics: Arc::new(bunnymeshdb::server::Metrics::new()),
     };
 
     // L3-as-filesystem (M4): mount in a background thread when requested.
@@ -225,6 +226,23 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
             ckpt_store.write().checkpoint().ok();
         }
     });
+
+    // Optional automatic log compaction + TTL GC for standalone nodes.
+    // Refuses mesh-synced nodes (same safety guard as `bunnymeshdb compact`).
+    if cfg.node.gc_interval_secs > 0 {
+        let gc_store = state.store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(cfg.node.gc_interval_secs));
+            loop {
+                tick.tick().await;
+                match gc_store.write().gc_live() {
+                    Ok(n) if n > 0 => tracing::info!("auto-compact: reclaimed {n} bytes"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(%e, "auto-compact skipped"),
+                }
+            }
+        });
+    }
 
     let shutdown_store = state.store.clone();
     let serve_app = app(state);

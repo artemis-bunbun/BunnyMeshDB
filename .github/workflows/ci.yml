@@ -50,3 +50,7 @@ jobs:
         run: cd sdk && npm install && npx tsc -p tsconfig.json
       - name: Boot daemon + run integration test
         run: node tests/integration.mjs
+      - name: Two-node mesh convergence
+        run: node tests/mesh.mjs
+      - name: Perf regression smoke
+        run: node tests/perf.mjs

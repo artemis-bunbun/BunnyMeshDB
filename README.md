@@ -151,16 +151,22 @@ See `sdk/README.md` for the full surface.
 - Admin (L1, `admin` perm): namespaces, capability issue/revoke, JSON-Schema.
 - Data (L2 cap-authenticated): `GET/PUT/DELETE /l2/{ns}/{key}?ttl=&versions=`,
   `GET /l2/{ns}?prefix=`, `/head`, `/changes?since=`, `/conflicts`,
-  `/events` (SSE), `/ql`.
+  `/events?since=` (SSE push, auto-resumes from the last seen seq),
+  `/ql`.
 - L3 (owner-identity-gated): `u/{pk}` variants of the data routes.
+- `GET /metrics` (open): runtime counters — requests, writes, namespaces.
 
 ## Operations
 
 - `bunnymeshdb backup|restore` — checkpoint + copy (see caveat above).
-- `bunnymeshdb compact <data-dir>` — reclaim disk on a TTL/churn-heavy
-  **standalone** node: drops superseded versions and expired TTL rows from the
-  log. Run with the daemon stopped; refuses a mesh-synced node (compaction is
-  only safe single-node). Sequence numbers restart at 1.
+- `bunnymeshdb compact <data-dir>` or config `node.gc_interval_secs` — reclaim
+  disk on a TTL/churn-heavy **standalone** node: drop superseded versions and
+  expired TTL rows. The CLI runs with the daemon stopped; `gc_interval_secs`
+  runs it automatically on a live daemon. Both refuse a mesh-synced node
+  (compaction is only safe single-node; online mesh GC needs protocol
+  fencing). Sequence numbers restart at 1.
+- Config: `node.durable_writes` (fsync every write), `node.sync_interval_secs`
+  (mesh pull cadence), `node.gc_interval_secs` (auto-compact cadence, 0 off).
 
 ## Documented performance
 

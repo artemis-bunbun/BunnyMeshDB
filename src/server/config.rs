@@ -38,6 +38,18 @@ pub struct Node {
     /// zero disables periodic pulls (writes still trigger a kick).
     #[serde(default = "default_sync_interval")]
     pub sync_interval_secs: u64,
+    /// Fsync every write before acknowledging (default false). When false the
+    /// store takes the fast no-per-record-fsync path — a crash can lose the
+    /// single in-flight write. Set true for durability-sensitive workloads
+    /// (write throughput drops accordingly).
+    #[serde(default)]
+    pub durable_writes: bool,
+    /// Automatically compact logs + GC expired TTL rows every this many
+    /// seconds (default 0 = off). Only applies to standalone (non-mesh-synced)
+    /// nodes; the same safety guard as `bunnymeshdb compact`. Mesh-connected
+    /// nodes are never auto-compacted (the log is the replication dedupe key).
+    #[serde(default = "default_gc_interval")]
+    pub gc_interval_secs: u64,
     /// Optional TLS termination. When both `cert_path` (PEM cert chain) and
     /// `key_path` (PEM private key) are set, the HTTP API is served over
     /// TLS — capability tokens in flight are then encrypted at the transport
@@ -82,6 +94,8 @@ impl Default for Config {
                 worker_threads: default_workers(),
                 mesh_sync: default_mesh_sync(),
                 sync_interval_secs: default_sync_interval(),
+                durable_writes: false,
+                gc_interval_secs: default_gc_interval(),
                 tls: None,
                 l3: L3 { default_quota: default_quota() },
             },
@@ -100,6 +114,8 @@ impl Default for Node {
             worker_threads: default_workers(),
             mesh_sync: default_mesh_sync(),
             sync_interval_secs: default_sync_interval(),
+            durable_writes: false,
+            gc_interval_secs: default_gc_interval(),
             tls: None,
             l3: L3 { default_quota: default_quota() },
         }
@@ -126,6 +142,9 @@ fn default_mesh_sync() -> bool {
 }
 fn default_sync_interval() -> u64 {
     30
+}
+fn default_gc_interval() -> u64 {
+    0
 }
 fn default_listen() -> String {
     "127.0.0.1:8848".to_string()
