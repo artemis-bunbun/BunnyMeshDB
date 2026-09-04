@@ -5,6 +5,7 @@ listen = "127.0.0.1:8851"
 p2p_listen = "9101"
 worker_threads = 2
 mesh_sync = true
+sync_interval_secs = 30
 
 [node.l3]
 default_quota = 1048576
@@ -12,4 +13,4 @@ default_quota = 1048576
 [[peers]]
 name = "node-a.bunnymeshdb.test"
 addr = "/ip4/127.0.0.1/tcp/9100"
-pin = "94396dc2d4d417230a1263e54286190e7a018262ded3ec56d5b804fc3faa140c"
+pin = "8d42996e76af5e6edb38d5ee175e18235883d7fe5dbaabc4f29c1800db7b28ad"

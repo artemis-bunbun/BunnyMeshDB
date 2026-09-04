@@ -1,2 +1,6 @@
 /target
-/data
+/data/node-a/
+/node-a/
+/node-b/
+/sdk/node_modules/
+/sdk/dist/

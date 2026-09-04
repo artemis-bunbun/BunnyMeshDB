@@ -1,88 +1,165 @@
 # BunnyMeshDB
 
-**bunnymeshdb** is a decentralized, distributed, speed-first database with
-multi-node mesh sync, capability-based auth, change feeds (poll + real-time
-SSE push), per-namespace JSON-Schema validation, TTL, conflict observation,
-and optional FUSE L3 filesystem mounts. It stores its own data (no
-redb/sled/rocksdb) and syncs peers over libp2p.
+A decentralized, multi-master database with libp2p mesh sync, capability-based
+auth, and a zero-dependency TypeScript client. It stores its own data — no
+rocksdb/redb/sled — and replicates via a signed append-only log.
+
+Intended for self-hosted, offline-first, multi-node workloads: two or more
+nodes that must keep converging without a central server.
+
+## What it does
+
+- **Multi-master sync.** Each node accepts writes independently (no leader).
+  Nodes pull missing entries from peers over libp2p on a configurable interval.
+- **Durable, verifiable storage.** A per-namespace merkle append-log with
+  CRC32 + SHA-256 chain; snapshots checkpoint the index. Crash-safe within one
+  in-flight record.
+- **Timestamped replication.** Hybrid logical clocks order concurrent writes;
+  default LWW converges deterministically; `register` policy keeps every
+  divergent version so you can reconcile.
+- **Capability auth.** Ed25519-signed bearer capabilities scoped to a tier and
+  namespace with `read`/`write`/`admin` perms. Revocable. Read-only caps can
+  read.
+- **Change feed + push.** Poll `changes?since=` for a gapless stream, or
+  subscribe to real-time SSE push (`GET /l2/{ns}/events`) — including writes
+  that arrive via mesh sync.
+- **TTL, JSON-Schema, conflicts.** Per-key expiry (replicated), per-namespace
+  JSON-Schema validation (replicated, enforced on every write), and a
+  `/conflicts` surface for register-policy namespaces.
+- **L3 filesystem (optional).** A FUSE mount backed by a namespace.
+
+## Layout
 
 ```
-src/         Rust engine (storage engine, HLC, merkle append-log, libp2p mesh)
-sdk/         Zero-dependency TypeScript client (dist/ via `npm run build`)
+src/         Rust engine (storage, HLC, merkle log, mesh, HTTP)
+sdk/         TypeScript client (no runtime deps; also runs on React Native)
 examples/    two-node mesh + docker-compose
-docs/        architecture
+docs/        architecture + performance
 ```
 
-## Quickstart — run a node
+## Install
+
+### From source
+
+Requires a Rust toolchain.
 
 ```bash
 cargo build --release
+# -> target/release/bunnymeshdb (CLI), target/release/bunnymeshdbd (daemon)
+```
 
-bunnymeshdb init ./data-dir          # generates ./data-dir/data (root keypair)
+### Docker
+
+```bash
+docker build -t bunnymeshdb .
+docker compose up -d --build   # two mesh nodes in containers
+```
+
+~15 MB Alpine image (static-musl, mimalloc).
+
+## Run a node
+
+```bash
+bunnymeshdb init ./data-dir              # creates ./data-dir/data (root keypair)
+
 cat > config.toml <<'EOF'
 [node]
-name = "dev.bunnymeshdb.test"
+name = "dev.bunnymeshdb.test"            # doubles as the scope authority
 data_dir = "./data-dir/data"
-listen = "127.0.0.1:8848"
-p2p_listen = "9100"
-worker_threads = 2
+listen = "127.0.0.1:8848"                # HTTP API
+p2p_listen = "9100"                      # libp2p mesh
+worker_threads = 4
 mesh_sync = true
+sync_interval_secs = 30                  # how often nodes pull from peers
 [node.l3]
 default_quota = 1048576
 EOF
 
 bunnymeshdbd serve --config config.toml
-# INFO bunnymeshdbd: admin cap: bmdb-cap:eyJzY29wZSI6…   <- your admin token
 ```
 
-## Quickstart — two-node mesh
+The daemon prints your admin capability on startup:
 
-A mesh node pulls namespaces it has in common with each peer. Bring up two
-nodes (see `examples/two-node/` for the full configs), then:
-
-```bash
-# node A (listen :8850) — create the namespace, issue a write cap
-curl -X POST localhost:8850/l1/namespaces -H "Authorization: Bearer $ADM_A" \
-  -H 'Content-Type: application/json' -d '{"name":"shared","policy":"register"}'
-# …issue caps for scope bmdb://node-a…/l2/shared and bmdb://node-b…/l2/shared
-
-curl -X PUT  localhost:8850/l2/shared/hello -H "Authorization: Bearer $CAP_A" -d 'hi'
-curl localhost:8851/l2/shared/hello -H "Authorization: Bearer $CAP_B"
-# → "hi"   (after the next 30s sync round)
+```
+INFO bunnymeshdbd: admin cap: bmdb-cap:eyJzY29wZSI6…
 ```
 
-Or `docker compose up -d --build` for the same two nodes in containers.
+`serve` will also initialize an empty data dir if the config points at one
+that hasn't been initialized yet.
 
-## Quickstart — SDK
+## Two-node mesh
+
+See `examples/two-node/` for complete configs (localhost and compose). The
+short version — node A and node B each list the other as a peer:
+
+```toml
+# config-a.toml
+[node]
+name = "node-a.bunnymeshdb.test"
+data_dir = "./node-a/data"
+listen = "127.0.0.1:8850"
+p2p_listen = "9100"
+
+[[peers]]
+name = "node-b.bunnymeshdb.test"
+addr = "/ip4/127.0.0.1/tcp/9101"
+
+# config-b.toml mirrors this, with node-a as its peer
+```
+
+Writes on either node converge to the other within one sync interval.
+Sync is pull-based: a node asks a peer for namespaces they share and pulls
+what it is missing. No corruption is ever introduced by a tick; a bad
+record is refused.
+
+## Backup / restore
+
+`bunnymeshdb backup <data-dir> --out <backup>` checkpoints then copies the
+data dir. `bunnymeshdb restore <backup> --data-dir <target>` restores it into
+a fresh dir.
+
+**Capability caveat:** capabilities are scoped to the node authority in the
+config `name`. Restoring to a node with the **same** `name` keeps existing
+caps valid. Restoring to a node with a **different** `name` invalidates them
+(reads return 403) — re-issue caps for the new host.
+
+## SDK
 
 ```bash
-cd sdk && npm run build   # produces dist/
+cd sdk && npm run build    # -> dist/
 ```
 
 ```ts
 import { BunnyMeshClient } from "./dist/index.js";
-const client = new BunnyMeshClient("http://127.0.0.1:8848", "bmdb-cap:eyJz…");
-client.createNamespace("notes", "register");
-const db = await client.openL2("notes");
-await db.put("welcome", "hello from the SDK");
-await db.subscribe((ev) => console.log("write:", ev.seq)); // real-time push
-console.log(await db.getText("welcome")); // "hello from the SDK"
 
-// Optional per-namespace JSON-Schema (enforced on every put, replicated):
-await client.setSchema("notes", { type: "object", required: ["title"] });
-await db.put("post", JSON.stringify({ title: "A" })); // ok
-await db.put("bad", "{}"); // → BunnyMeshError 400 schema_violation
+const client = new BunnyMeshClient("http://127.0.0.1:8848", "bmdb-cap:eyJ…");
+
+await client.createNamespace("notes", "register");
+const db = await client.openL2("notes");
+
+await db.put("welcome", "hello");
+const value = await db.getText("welcome");          // "hello"
+await db.subscribe((ev) => console.log("write:", ev.seq)); // real-time push
 ```
 
-## Container / Docker
+Zero runtime dependencies; runs in Node ≥18, browsers, and React Native.
+See `sdk/README.md` for the full surface.
 
-`docker build -t bunnymeshdb .` → static-musl pair in a ~15 MB Alpine image
-(with mimalloc). `docker-compose.yml` runs two mesh nodes.
+## HTTP API
 
-## Docs
+- `GET /healthz`
+- Admin (L1, `admin` perm): namespaces, capability issue/revoke, JSON-Schema.
+- Data (L2 cap-authenticated): `GET/PUT/DELETE /l2/{ns}/{key}?ttl=&versions=`,
+  `GET /l2/{ns}?prefix=`, `/head`, `/changes?since=`, `/conflicts`,
+  `/events` (SSE), `/ql`.
+- L3 (owner-identity-gated): `u/{pk}` variants of the data routes.
 
-- `docs/ARCHITECTURE.md` — storage, log, auth, mesh, sessions, L3.
-- `sdk/README.md` — full SDK surface.
+## Documented performance
+
+See `docs/BENCHMARKS.md` for measured throughput and memory under
+single-node GET/PUT and multi-worker concurrency, including the musl-vs-glibc
+difference and the mimalloc fix.
 
 ## License
+
 AGPL-3.0

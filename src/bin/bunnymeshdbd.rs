@@ -79,10 +79,25 @@ fn main() {
 }
 
 async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
-    let kp = match meta::load(std::path::Path::new(&cfg.node.data_dir)) {
+    let data_path = std::path::Path::new(&cfg.node.data_dir);
+    // Guarded serve: if the data dir is uninitialized (no meta.bin), initialize
+    // it inline so `serve` works on a fresh config without a separate `init`.
+    // Never clobbers: if meta.bin exists but fails to load, that is corrupt and
+    // we refuse to touch it.
+    let kp = match meta::load(data_path) {
         Ok(kp) => kp,
+        Err(_) if !data_path.join("meta.bin").exists() => {
+            tracing::info!("data dir uninitialized — initializing {}", cfg.node.data_dir);
+            match meta::init(data_path) {
+                Ok(kp) => kp,
+                Err(e) => {
+                    eprintln!("fatal: init data dir: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Err(e) => {
-            eprintln!("fatal: {e} (run `bunnymeshdb init <dir>` first, pass its data dir in config)");
+            eprintln!("fatal: {e} (meta.bin exists but is unreadable — refusing to overwrite)");
             std::process::exit(1);
         }
     };
@@ -147,7 +162,7 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
             config_path,
             Some(change_tx.clone()),
         );
-        let task = tokio::spawn(engine.run(rx, 30));
+        let task = tokio::spawn(engine.run(rx, cfg.node.sync_interval_secs.max(1)));
         sync_tx = Some(tx);
         sync_task = Some(task);
     } else {

@@ -33,6 +33,11 @@ pub struct Node {
     /// this node's log.
     #[serde(default = "default_mesh_sync")]
     pub mesh_sync: bool,
+    /// Seconds between mesh pull rounds (default 30). Lower (e.g. 5) for more
+    /// responsive convergence at the cost of a little extra background I/O;
+    /// zero disables periodic pulls (writes still trigger a kick).
+    #[serde(default = "default_sync_interval")]
+    pub sync_interval_secs: u64,
     /// Optional TLS termination. When both `cert_path` (PEM cert chain) and
     /// `key_path` (PEM private key) are set, the HTTP API is served over
     /// TLS — capability tokens in flight are then encrypted at the transport
@@ -76,6 +81,7 @@ impl Default for Config {
                 p2p_listen: default_p2p_listen(),
                 worker_threads: default_workers(),
                 mesh_sync: default_mesh_sync(),
+                sync_interval_secs: default_sync_interval(),
                 tls: None,
                 l3: L3 { default_quota: default_quota() },
             },
@@ -93,6 +99,7 @@ impl Default for Node {
             p2p_listen: default_p2p_listen(),
             worker_threads: default_workers(),
             mesh_sync: default_mesh_sync(),
+            sync_interval_secs: default_sync_interval(),
             tls: None,
             l3: L3 { default_quota: default_quota() },
         }
@@ -116,6 +123,9 @@ fn default_workers() -> usize {
 }
 fn default_mesh_sync() -> bool {
     true
+}
+fn default_sync_interval() -> u64 {
+    30
 }
 fn default_listen() -> String {
     "127.0.0.1:8848".to_string()
