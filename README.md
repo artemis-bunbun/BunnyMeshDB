@@ -159,6 +159,12 @@ See `sdk/README.md` for the full surface.
 ## Operations
 
 - `bunnymeshdb backup|restore` — checkpoint + copy (see caveat above).
+- `bunnymeshdb rotate-key <data-dir> [--drop-predecessor] [--reissue-admin]` —
+  rotate the root ed25519 keypair (daemon stopped). By default the previous
+  key stays valid so existing capabilities keep working (graceful roll);
+  `--drop-predecessor` severs it — the compromise-recovery path where every
+  cap it signed is invalidated and must be re-issued. `--reissue-admin`
+  re-signs the persisted admin cap with the new key so you keep admin access.
 - `bunnymeshdb compact <data-dir>` or config `node.gc_interval_secs` — reclaim
   disk on a TTL/churn-heavy **standalone** node: drop superseded versions and
   expired TTL rows. The CLI runs with the daemon stopped; `gc_interval_secs`

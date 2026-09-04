@@ -3,7 +3,7 @@
 //! The ladder: L3 = self-identity (owner `u/<hex>`, no cap); L2 = signed
 //! capabilities with scope+perms; L1 = host-root admin capability.
 
-use crate::caps::{Capability, PermSet, RevocationSet, Scope, Tier};
+use crate::caps::{Capability, PermSet, RevocationSet, RootKeyring, Scope, Tier};
 use crate::core::ident::PublicKey;
 use crate::storage::{ConflictPolicy, Store};
 use std::collections::HashMap;
@@ -48,7 +48,7 @@ pub fn authorize(
     principal: &PublicKey,
     perms: PermSet,
     caps: &[Capability],
-    root: &PublicKey,
+    keyring: &RootKeyring,
     revocations: &RevocationSet,
     host_name: &str,
     now_ms: u64,
@@ -59,7 +59,7 @@ pub fn authorize(
     for c in caps {
         arcs.push(Arc::new(c.clone()));
     }
-    authorize_cached(scope, principal, perms, &arcs, root, revocations, host_name, now_ms, None, 0)
+    authorize_cached(scope, principal, perms, &arcs, keyring, revocations, host_name, now_ms, None, 0)
 }
 
 /// Like [`authorize`], but skips the per-request ed25519 signature check and
@@ -95,7 +95,7 @@ pub fn authorize_cached(
     principal: &PublicKey,
     perms: PermSet,
     caps: &[Arc<Capability>],
-    root: &PublicKey,
+    keyring: &RootKeyring,
     revocations: &RevocationSet,
     host_name: &str,
     now_ms: u64,
@@ -130,7 +130,7 @@ pub fn authorize_cached(
                     && (*cap).scope.ns == "*"
                     && (*cap).perms.contains(PermSet::ADMIN)
                     && (*cap)
-                        .verify_or_cached(root, principal, revocations, now_ms, cached_ok)
+                        .verify_or_cached(keyring, principal, revocations, now_ms, cached_ok)
                         .is_ok();
                 if ok {
                     mark_verified(cache.as_deref(), &(*cap).nonce, epoch, cached_ok);
@@ -142,7 +142,7 @@ pub fn authorize_cached(
         Tier::L2 => {
             for cap in caps {
                 let cached_ok = epoch_ok(cache.as_deref(), &(*cap).nonce, epoch);
-                let valid = (*cap).verify_or_cached(root, principal, revocations, now_ms, cached_ok);
+                let valid = (*cap).verify_or_cached(keyring, principal, revocations, now_ms, cached_ok);
                 if valid.is_err() {
                     // Try the next cap; the request is only denied if none hold.
                     continue;
@@ -261,14 +261,14 @@ mod tests {
         let owner = Keypair::generate();
         let other = Keypair::generate();
         let s = scope(&format!("bmdb://api.test/l3/u/{}", owner.public()));
-        assert!(authorize(&s, &owner.public(), PermSet::WRITE, &[], &root.public(), &RevocationSet::new(), "api.test", now_ms()).is_ok());
+        assert!(authorize(&s, &owner.public(), PermSet::WRITE, &[], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()).is_ok());
         assert!(matches!(
-            authorize(&s, &other.public(), PermSet::WRITE, &[], &root.public(), &RevocationSet::new(), "api.test", now_ms()),
+            authorize(&s, &other.public(), PermSet::WRITE, &[], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()),
             Err(AuthError::Forbidden(_))
         ));
         // L3 cap is not a thing — other host's name is rejected.
         assert!(matches!(
-            authorize(&s, &owner.public(), PermSet::WRITE, &[], &root.public(), &RevocationSet::new(), "other.test", now_ms()),
+            authorize(&s, &owner.public(), PermSet::WRITE, &[], &RootKeyring::current(root.public()), &RevocationSet::new(), "other.test", now_ms()),
             Err(AuthError::Unauthorized(_))
         ));
     }
@@ -291,42 +291,42 @@ mod tests {
         );
         let caps = vec![cap.clone()];
         // ok on scope and sub-prefix
-        assert!(authorize(&base, &user.public(), PermSet::READ, &caps, &root.public(), &RevocationSet::new(), "api.test", now_ms()).is_ok());
-        assert!(authorize(&sub, &user.public(), PermSet::WRITE, &caps, &root.public(), &RevocationSet::new(), "api.test", now_ms()).is_ok());
+        assert!(authorize(&base, &user.public(), PermSet::READ, &caps, &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()).is_ok());
+        assert!(authorize(&sub, &user.public(), PermSet::WRITE, &caps, &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()).is_ok());
         // wrong ns
         assert!(matches!(
-            authorize(&other_ns, &user.public(), PermSet::READ, &caps, &root.public(), &RevocationSet::new(), "api.test", now_ms()),
+            authorize(&other_ns, &user.public(), PermSet::READ, &caps, &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()),
             Err(AuthError::Unauthorized(_))
         ));
         // no cap at all
         assert!(matches!(
-            authorize(&base, &user.public(), PermSet::READ, &[], &root.public(), &RevocationSet::new(), "api.test", now_ms()),
+            authorize(&base, &user.public(), PermSet::READ, &[], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()),
             Err(AuthError::Unauthorized(_))
         ));
         // perms missing
         let read_only = Capability::sign_for(base.clone(), PermSet::READ, None, 2, user.public(), &root);
-        assert!(authorize(&base, &user.public(), PermSet::READ, &[read_only.clone()], &root.public(), &RevocationSet::new(), "api.test", now_ms()).is_ok());
+        assert!(authorize(&base, &user.public(), PermSet::READ, &[read_only.clone()], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()).is_ok());
         assert!(matches!(
-            authorize(&base, &user.public(), PermSet::WRITE, &[read_only], &root.public(), &RevocationSet::new(), "api.test", now_ms()),
+            authorize(&base, &user.public(), PermSet::WRITE, &[read_only], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()),
             Err(AuthError::Unauthorized(_))
         ));
         // expired cap
         let expired = Capability::sign_for(base.clone(), PermSet::READ, Some(now_ms() - 10), 3, user.public(), &root);
         assert!(matches!(
-            authorize(&base, &user.public(), PermSet::READ, &[expired], &root.public(), &RevocationSet::new(), "api.test", now_ms()),
+            authorize(&base, &user.public(), PermSet::READ, &[expired], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()),
             Err(AuthError::Unauthorized(_))
         ));
         // revoked cap
         let mut rev = RevocationSet::new();
         rev.revoke_principal(&base, &user.public().to_string());
         assert!(matches!(
-            authorize(&base, &user.public(), PermSet::READ, &[cap], &root.public(), &rev, "api.test", now_ms()),
+            authorize(&base, &user.public(), PermSet::READ, &[cap], &RootKeyring::current(root.public()), &rev, "api.test", now_ms()),
             Err(AuthError::Unauthorized(_))
         ));
         // narrower cap cannot cover wider request
         let narrow = Capability::sign_for(scope("bmdb://api.test/l2/photos/x"), PermSet::WRITE, None, 4, user.public(), &root);
         assert!(matches!(
-            authorize(&base, &user.public(), PermSet::WRITE, &[narrow], &root.public(), &RevocationSet::new(), "api.test", now_ms()),
+            authorize(&base, &user.public(), PermSet::WRITE, &[narrow], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()),
             Err(AuthError::Unauthorized(_))
         ));
     }
@@ -343,9 +343,9 @@ mod tests {
         );
         let l2_only = Capability::sign(scope("bmdb://api.test/l2/photos"), PermSet::READ, None, 12, &root);
         let l1_scope = Scope { host: "api.test".into(), tier: Tier::L1, ns: "*".into(), prefix: None };
-        assert!(authorize(&l1_scope, &root.public(), PermSet::ADMIN, &[admin.clone()], &root.public(), &RevocationSet::new(), "api.test", now_ms()).is_ok());
+        assert!(authorize(&l1_scope, &root.public(), PermSet::ADMIN, &[admin.clone()], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()).is_ok());
         assert!(matches!(
-            authorize(&l1_scope, &root.public(), PermSet::ADMIN, &[l2_only], &root.public(), &RevocationSet::new(), "api.test", now_ms()),
+            authorize(&l1_scope, &root.public(), PermSet::ADMIN, &[l2_only], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()),
             Err(AuthError::Unauthorized(_))
         ));
     }

@@ -47,6 +47,22 @@ pub fn load(dir: &Path) -> Result<Keypair, String> {
     Ok(Keypair::from_seed(seed))
 }
 
+/// Overwrite the active keypair in meta.bin (root-key rotation). Writes to a
+/// temp file (0600) then renames over meta.bin, so a crash never leaves a
+/// half-written key. The previous active key remains verifiable only if the
+/// caller kept it in `sys/root_chain` — rotation must persist that chain too.
+pub fn write(dir: &Path, kp: &Keypair) -> Result<(), String> {
+    let path = dir.join("meta.bin");
+    let tmp = dir.join("meta.bin.tmp");
+    let mut bytes = Vec::with_capacity(8 + 32 + 32);
+    bytes.extend_from_slice(META_MAGIC);
+    bytes.extend_from_slice(&kp.public().to_bytes());
+    bytes.extend_from_slice(&kp.to_seed());
+    write_mode600(&tmp, &bytes)?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("replace {path:?}: {e}"))?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn write_mode600(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;

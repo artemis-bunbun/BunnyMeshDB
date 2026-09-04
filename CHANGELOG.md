@@ -71,3 +71,16 @@ Commit that added `TAG_SCHEMA` changed the on-disk log record set (the
 are unchanged and still replay.
 
 Full history: see git log. Repo: `github.com/artemis-bunbun/BunnyMeshDB`.
+
+## unreleased
+
+- **Root key rotation** (`bunnymeshdb rotate-key <data-dir>`): swap the active
+  ed25519 keypair without bricking the deployment. Graceful mode keeps the
+  previous key valid (a `RootKeyring` on the verification path accepts current
+  + retired predecessors, so already-issued capabilities and records keep
+  verifying; new caps mint with the fresh key). `--drop-predecessor` severs
+  the old key — the compromise-recovery path where its caps are all invalid
+  and must be re-issued; `--reissue-admin` re-signs the persisted admin cap so
+  the operator isn't locked out. Persists retired keys in `sys/root_chain`;
+  chain is written before meta.bin so a crash is re-runnable. Offline op
+  (daemon stopped). 2 new tests (64 total).

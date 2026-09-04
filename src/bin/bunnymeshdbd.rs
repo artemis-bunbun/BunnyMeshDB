@@ -1,7 +1,7 @@
 //! `bunnymeshdbd` — the server daemon: config → store → HTTP API.
 //! Checkpoints on SIGINT/SIGTERM and every 60 s.
 
-use bunnymeshdb::caps::{Capability, PermSet, RevocationSet, Scope, Tier};
+use bunnymeshdb::caps::{Capability, PermSet, RevocationSet, RootKeyring, Scope, Tier};
 use bunnymeshdb::core::ident::PublicKey;
 use bunnymeshdb::core::meta;
 use bunnymeshdb::server::config::Config;
@@ -141,6 +141,17 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
         }
     }
 
+    // Retired root keys kept valid across graceful rotations (sys/root_chain,
+    // one hex pubkey per line). Active key (== root) always verifies; retired
+    // predecessors let caps issued before a rotation keep working. A
+    // `rotate-key --drop-predecessor` clears this list so a compromised key
+    // cannot mint new caps (existing ones must be re-issued).
+    let mut retired: Vec<PublicKey> = Vec::with_capacity(0);
+    if let Some(v) = store.meta_get("sys/root_chain") {
+        retired = RootKeyring::parse_chain(v);
+    }
+    let keyring = RootKeyring { active: root, retired };
+
     tracing::info!(host = %cfg.node.name, listen = %cfg.node.listen, "serving");
     tracing::info!("admin cap: {admin_cap}");
 
@@ -176,6 +187,7 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
     let state = AppState {
         store: store_arc,
         root,
+        keyring: Arc::new(keyring),
         kp: Arc::new(kp),
         revocations: Arc::new(RwLock::new(revocations)),
         host_name: cfg.node.name.clone(),

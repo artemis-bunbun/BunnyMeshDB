@@ -76,6 +76,23 @@ enum Commands {
         config: PathBuf,
         name: String,
     },
+    /// Rotate the node's root keypair. Persists a fresh key as active; the
+    /// previous active key is kept valid (so existing caps keep working)
+    /// unless --drop-predecessor, which severs it (existing caps must be
+    /// re-issued). The daemon must be stopped. Pass --reissue-admin to sign
+    /// a fresh L1 admin cap with the new key.
+    RotateKey {
+        /// Node data dir to rotate.
+        data: PathBuf,
+        /// Sever the previous root key (compromise recovery): it can no
+        /// longer mint caps; all its caps are invalid and must be re-issued.
+        #[arg(long)]
+        drop_predecessor: bool,
+        /// Also sign a fresh L1 admin cap with the new key (recommended after
+        /// a drop, to avoid losing admin access).
+        #[arg(long)]
+        reissue_admin: bool,
+    },
     /// Snapshot a node's data dir (checkpointed, crash-consistent) to `out`.
     Backup {
         /// Node data dir to back up.
@@ -199,6 +216,29 @@ fn main() {
             match bunnymeshdb::storage::compact_dir(&data) {
                 Ok(reclaimed) => {
                     println!("compacted {} ({} bytes reclaimed); logs restarted at seq 1", data.display(), reclaimed);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::RotateKey { data, drop_predecessor, reissue_admin } => {
+            match bunnymeshdb::core::rotate::rotate_root(&data, drop_predecessor, reissue_admin) {
+                Ok(out) => {
+                    if let Some(h) = out.admin_cap {
+                        println!("new admin cap: {h}");
+                    }
+                    if let Some(w) = out.admin_warning {
+                        eprintln!("warning: {w}");
+                    }
+                    if out.dropped {
+                        println!("rotated root key: {} → {}", out.old_root, out.new_root);
+                        println!("predecessor DROPPED — every cap signed by {} is now invalid; re-issue them.", out.old_root);
+                    } else {
+                        println!("rotated root key: {} → {}", out.old_root, out.new_root);
+                        println!("predecessor {} kept valid — existing caps/records still verify (graceful).", out.old_root);
+                    }
                 }
                 Err(e) => {
                     eprintln!("error: {e}");

@@ -217,6 +217,67 @@ impl RevocationSet {
     }
 }
 
+/// Valid root signing keys: `active` (current, also the host identity) plus
+/// `retired` predecessors kept valid across a graceful rotation. A
+/// capability verifies iff its `issuer` is in this set. A
+/// `rotate-key --drop-predecessor` clears `retired`, so a compromised key
+/// can no longer mint caps — at the cost of invalidating every cap it signed
+/// (callers must re-issue).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootKeyring {
+    pub active: PublicKey,
+    pub retired: Vec<PublicKey>,
+}
+
+impl RootKeyring {
+    pub fn current(active: PublicKey) -> RootKeyring {
+        RootKeyring { active, retired: Vec::with_capacity(0) }
+    }
+
+    /// Active + (publicly-kept) retired predecessors.
+    pub fn accepts_issuer(&self, issuer: &PublicKey) -> bool {
+        self.key_for_issuer(issuer).is_some()
+    }
+
+    /// The key that must validate `issuer`'s signature, if any.
+    pub fn key_for_issuer(&self, issuer: &PublicKey) -> Option<PublicKey> {
+        if *issuer == self.active {
+            return Some(self.active);
+        }
+        for k in &self.retired {
+            if *k == *issuer {
+                return Some(*k);
+            }
+        }
+        None
+    }
+
+    /// Persist `retired` as one hex pubkey per line (meta `sys/root_chain`).
+    /// `active` lives in meta.bin and is not serialized here.
+    pub fn to_chain_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(33 * self.retired.len());
+        for k in &self.retired {
+            out.extend_from_slice(&(format!("{}\n", k).into_bytes()));
+        }
+        out
+    }
+
+    pub fn parse_chain(bytes: &[u8]) -> Vec<PublicKey> {
+        let mut out = Vec::with_capacity(0);
+        for line in String::from_utf8_lossy(bytes).lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match line.parse::<PublicKey>() {
+                Ok(k) => out.push(k),
+                Err(_) => {} // tolerate a stray line; never gate auth on text noise
+            }
+        }
+        out
+    }
+}
+
 /// A signed capability. `sig` is over the canonical JSON of the other fields.
 /// `subject` binds the cap to one principal pk — revocation by
 /// `(scope, to)` in the L1 revoke endpoint targets exactly this principal.
@@ -301,16 +362,18 @@ impl Capability {
 
     pub fn verify(
         &self,
-        root: &PublicKey,
+        keyring: &RootKeyring,
         principal: &PublicKey,
         revocations: &RevocationSet,
         now_ms: u64,
     ) -> Result<(), CapError> {
-        if self.issuer != *root {
-            return Err(CapError::BadIssuer);
-        }
-        if !root.verify(&self.canonical_bytes(), &self.sig) {
-            return Err(CapError::BadSig);
+        match keyring.key_for_issuer(&self.issuer) {
+            None => return Err(CapError::BadIssuer),
+            Some(issuer) => {
+                if !issuer.verify(&self.canonical_bytes(), &self.sig) {
+                    return Err(CapError::BadSig);
+                }
+            }
         }
         if self.subject != *principal {
             return Err(CapError::Malformed); // presented by wrong principal
@@ -333,13 +396,13 @@ impl Capability {
     /// expired token is never honored via the cache.
     pub fn verify_or_cached(
         &self,
-        root: &PublicKey,
+        keyring: &RootKeyring,
         principal: &PublicKey,
         revocations: &RevocationSet,
         now_ms: u64,
         cached_ok: bool,
     ) -> Result<(), CapError> {
-        if self.issuer != *root {
+        if !keyring.accepts_issuer(&self.issuer) {
             return Err(CapError::BadIssuer);
         }
         if self.subject != *principal {
@@ -353,8 +416,13 @@ impl Capability {
         if cached_ok {
             return Ok(());
         }
-        if !root.verify(&self.canonical_bytes(), &self.sig) {
-            return Err(CapError::BadSig);
+        match keyring.key_for_issuer(&self.issuer) {
+            None => return Err(CapError::BadIssuer),
+            Some(issuer) => {
+                if !issuer.verify(&self.canonical_bytes(), &self.sig) {
+                    return Err(CapError::BadSig);
+                }
+            }
         }
         if revocations.is_revoked(&self.scope, &principal.to_string(), self.nonce) {
             return Err(CapError::Revoked);
@@ -462,12 +530,12 @@ mod tests {
         let scope = Scope::parse("bmdb://api.test/l2/photos/a").unwrap();
         let cap = Capability::sign(scope, PermSet::READ.union(PermSet::WRITE), Some(now_ms() + 60_000), 42, &root);
         let rev = RevocationSet::new();
-        assert!(cap.verify(&root.public(), &root.public(), &rev, now_ms()).is_ok());
+        assert!(cap.verify(&RootKeyring::current(root.public()), &root.public(), &rev, now_ms()).is_ok());
         // JSON wire roundtrip preserves everything
         let j = cap.to_json();
         let cap2 = Capability::from_json(&j).unwrap();
         assert_eq!(cap, cap2);
-        assert!(cap2.verify(&root.public(), &root.public(), &rev, now_ms()).is_ok());
+        assert!(cap2.verify(&RootKeyring::current(root.public()), &root.public(), &rev, now_ms()).is_ok());
         assert!(cap.to_header().starts_with("bmdb-cap:"));
     }
 
@@ -484,11 +552,11 @@ mod tests {
         );
         // Verify against root (cap signed by non-root) → BadIssuer
         assert_eq!(
-            cap.verify(&root.public(), &other.public(), &RevocationSet::new(), now_ms()),
+            cap.verify(&RootKeyring::current(root.public()), &other.public(), &RevocationSet::new(), now_ms()),
             Err(CapError::BadIssuer)
         );
         // And it DOES verify under its real issuer at least for sanity
-        assert!(cap.verify(&other.public(), &other.public(), &RevocationSet::new(), now_ms()).is_ok());
+        assert!(cap.verify(&RootKeyring::current(other.public()), &other.public(), &RevocationSet::new(), now_ms()).is_ok());
     }
 
     #[test]
@@ -504,13 +572,13 @@ mod tests {
         let mut tampered = cap.clone();
         tampered.scope = Scope::parse("bmdb://h/l2/other").unwrap();
         assert_eq!(
-            tampered.verify(&root.public(), &root.public(), &RevocationSet::new(), now_ms()),
+            tampered.verify(&RootKeyring::current(root.public()), &root.public(), &RevocationSet::new(), now_ms()),
             Err(CapError::BadSig)
         );
         let mut tampered2 = cap.clone();
         tampered2.perms = PermSet::WRITE;
         assert_eq!(
-            tampered2.verify(&root.public(), &root.public(), &RevocationSet::new(), now_ms()),
+            tampered2.verify(&RootKeyring::current(root.public()), &root.public(), &RevocationSet::new(), now_ms()),
             Err(CapError::BadSig)
         );
     }
@@ -526,7 +594,7 @@ mod tests {
             &root,
         );
         assert_eq!(
-            cap.verify(&root.public(), &root.public(), &RevocationSet::new(), now_ms()),
+            cap.verify(&RootKeyring::current(root.public()), &root.public(), &RevocationSet::new(), now_ms()),
             Err(CapError::Expired)
         );
     }
@@ -538,16 +606,16 @@ mod tests {
         let scope = Scope::parse("bmdb://h/l2/n").unwrap();
         let cap = Capability::sign_for(scope.clone(), PermSet::READ, None, 99, principal.public(), &root);
         let mut rev = RevocationSet::new();
-        assert!(cap.verify(&root.public(), &principal.public(), &rev, now_ms()).is_ok());
+        assert!(cap.verify(&RootKeyring::current(root.public()), &principal.public(), &rev, now_ms()).is_ok());
         rev.revoke_principal(&scope, &principal.public().to_string());
         assert_eq!(
-            cap.verify(&root.public(), &principal.public(), &rev, now_ms()),
+            cap.verify(&RootKeyring::current(root.public()), &principal.public(), &rev, now_ms()),
             Err(CapError::Revoked)
         );
         rev = RevocationSet::new();
         rev.revoke_nonce(99);
         assert_eq!(
-            cap.verify(&root.public(), &principal.public(), &rev, now_ms()),
+            cap.verify(&RootKeyring::current(root.public()), &principal.public(), &rev, now_ms()),
             Err(CapError::Revoked)
         );
     }
@@ -565,7 +633,7 @@ mod tests {
         let mut bad = cap.clone();
         bad.sig[0] ^= 0x01;
         assert_eq!(
-            bad.verify(&root.public(), &root.public(), &RevocationSet::new(), now_ms()),
+            bad.verify(&RootKeyring::current(root.public()), &root.public(), &RevocationSet::new(), now_ms()),
             Err(CapError::BadSig)
         );
     }

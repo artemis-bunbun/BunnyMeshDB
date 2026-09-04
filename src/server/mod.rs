@@ -4,7 +4,7 @@ pub mod config;
 pub mod tls;
 pub mod ratelimit;
 
-use crate::caps::{Capability, PermSet, RevocationSet, Scope, Tier, TokenCache};
+use crate::caps::{Capability, PermSet, RevocationSet, RootKeyring, Scope, Tier, TokenCache};
 use crate::core::hlc::Hlc;
 use crate::core::ident::{Keypair, PublicKey};
 use crate::ns::{account_write, authorize_cached, ensure_l3_namespace, CapCache};
@@ -34,6 +34,8 @@ use std::sync::Arc;
 pub struct AppState {
     pub store: Arc<PLRwLock<Store>>,
     pub root: PublicKey,
+    /// Valid root signing keys: active (== `root`) + retired predecessors.
+    pub keyring: Arc<RootKeyring>,
     pub kp: Arc<Keypair>,
     pub revocations: Arc<PLRwLock<RevocationSet>>,
     pub host_name: String,
@@ -210,7 +212,7 @@ fn auth_l1_l2(
     // happened-before (visible to this reader) or is blocked on the write
     // lock, so a cached hit can never mask a revocation.
     let epoch = state.rev_epoch.load(std::sync::atomic::Ordering::SeqCst);
-    authorize_cached(scope, &principal, perms, &caps.0, &state.root, &revs, &state.host_name, now_ms, Some(&*state.cap_cache), epoch)
+    authorize_cached(scope, &principal, perms, &caps.0, &state.keyring, &revs, &state.host_name, now_ms, Some(&*state.cap_cache), epoch)
         .map_err(auth_to_response)?;
     Ok(principal)
 }
@@ -225,7 +227,7 @@ fn auth_l3(state: &AppState, scope: &Scope, now_ms: u64) -> Result<PublicKey, Re
         .parse::<PublicKey>()
         .map_err(|_| err_json(StatusCode::FORBIDDEN, "forbidden"))?;
     let revs = state.revocations.read();
-    authorize_cached(scope, &pk, PermSet::READ.union(PermSet::WRITE), &[], &state.root, &revs, &state.host_name, now_ms, None, 0)
+    authorize_cached(scope, &pk, PermSet::READ.union(PermSet::WRITE), &[], &state.keyring, &revs, &state.host_name, now_ms, None, 0)
         .map_err(auth_to_response)?;
     Ok(pk)
 }
