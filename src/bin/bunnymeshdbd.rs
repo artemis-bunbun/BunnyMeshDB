@@ -12,6 +12,19 @@ use parking_lot::{Mutex, RwLock};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// mimalloc (optional, `cargo build --features mimalloc`): Microsoft's
+// allocator. We measured 32-conn GET / 4 workers: glibc + native malloc
+// ~278k/s, musl + native malloc ~75k/s (musl's single shared heap collapses
+// under worker contention), musl + mimalloc ~210-250k/s (parity with glibc),
+// glibc + mimalloc ~244k/s (native glibc malloc is slightly better). So this
+// exists to rescue Alpine/musl builds; leave it OFF for glibc/Ubuntu. The
+// Docker-alpine build enables it via `--features mimalloc`.
+#[cfg(feature = "mimalloc")]
+use mimalloc::MiMalloc;
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "bunnymeshdbd", about = "BunnyMeshDB daemon")]
 struct Cli {

@@ -10,6 +10,7 @@ codegen-units = 1
 strip = true
 
 [dependencies]
+mimalloc = { version = "0.1.52", optional = true }
 axum = { version = "0.8.9", features = ["macros"] }
 clap = { version = "4.6.6", features = ["derive"] }
 ed25519-dalek = { version = "3.0.0", features = ["rand_core"] }
@@ -28,3 +29,6 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "mac
 toml = "1.1.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[features]
+mimalloc = ["dep:mimalloc"]

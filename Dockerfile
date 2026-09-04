@@ -17,10 +17,17 @@
 # --- Build stage: rust toolchain on musl (glibc-free crates) ---
 FROM rust:alpine AS build
 WORKDIR /src
-RUN apk add --no-cache musl-dev fuse3 fuse3-dev
+# musl-dev/fuse3 are C-dep headers; build-base+cc compile the vendored
+# mimalloc C sources.
+RUN apk add --no-cache musl-dev fuse3 fuse3-dev build-base cc
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN cargo build --release
+# --features mimalloc: musl's single-heap malloc collapses under multi-worker
+# contention (we measured 32-conn GET 4 workers: musl ~75k/s vs glibc ~278k/s).
+# mimalloc's per-thread arenas recover Alpine to glibc parity (~240k/s).
+# Keep OFF for glibc/Ubuntu (native glibc malloc is slightly faster than
+# mimalloc there); the musl build enables it.
+RUN cargo build --release --features mimalloc
 
 # --- Runtime: minimal Alpine with just FUSE for L3 ---
 FROM alpine:latest
