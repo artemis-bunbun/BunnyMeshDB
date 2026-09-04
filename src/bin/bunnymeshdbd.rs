@@ -152,14 +152,16 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
     let store_arc: Arc<RwLock<bunnymeshdb::storage::Store>> = Arc::new(RwLock::new(store));
     let (change_tx, _) = tokio::sync::broadcast::channel::<String>(256);
     let (sync_tx, sync_task);
+    // Shared runtime config: the mesh engine dials from this Arc, and the
+    // admin peer API mutates + saves it (so live peer edits reach the engine).
+    let runtime_cfg: Arc<Mutex<bunnymeshdb::server::config::Config>> = Arc::new(Mutex::new(cfg.clone()));
     if cfg.node.mesh_sync {
         let (tx, rx) = tokio::sync::mpsc::channel::<()>(64);
-        let sync_cfg = Arc::new(Mutex::new(cfg.clone()));
         let engine = bunnymeshdb::net::SyncEngine::new(
             store_arc.clone(),
             kp.clone(),
-            sync_cfg,
-            config_path,
+            runtime_cfg.clone(),
+            config_path.clone(),
             Some(change_tx.clone()),
         );
         let task = tokio::spawn(engine.run(rx, cfg.node.sync_interval_secs.max(1)));
@@ -184,6 +186,13 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
         cap_cache: Arc::new(bunnymeshdb::ns::CapCache::new()),
         token_cache: Arc::new(bunnymeshdb::caps::TokenCache::new()),
         metrics: Arc::new(bunnymeshdb::server::Metrics::new()),
+        ratelimiter: Arc::new(bunnymeshdb::server::ratelimit::RateLimiter::new(
+            cfg.node.ratelimit.enabled,
+            cfg.node.ratelimit.max_requests,
+            cfg.node.ratelimit.window_secs,
+        )),
+        config: runtime_cfg,
+        config_path,
     };
 
     // L3-as-filesystem (M4): mount in a background thread when requested.

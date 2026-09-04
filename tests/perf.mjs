@@ -32,6 +32,7 @@ listen = "127.0.0.1:${httpPort}"
 p2p_listen = "0"
 worker_threads = 4
 mesh_sync = false
+ratelimit = { enabled = false }
 [node.l3]
 default_quota = 1048576
 `);

@@ -50,6 +50,9 @@ pub struct Node {
     /// nodes are never auto-compacted (the log is the replication dedupe key).
     #[serde(default = "default_gc_interval")]
     pub gc_interval_secs: u64,
+    /// Request rate limiting (on by default).
+    #[serde(default)]
+    pub ratelimit: Ratelimit,
     /// Optional TLS termination. When both `cert_path` (PEM cert chain) and
     /// `key_path` (PEM private key) are set, the HTTP API is served over
     /// TLS — capability tokens in flight are then encrypted at the transport
@@ -74,6 +77,36 @@ pub struct L3 {
     pub default_quota: u64,
 }
 
+/// Request rate limiting. On by default to keep a default-deployed node cheap
+/// to DoS; a developer can dial it back (or disable via `enabled = false`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Ratelimit {
+    #[serde(default = "default_ratelimit_enabled")]
+    pub enabled: bool,
+    /// Max requests per token per window; 0 = effectively unlimited.
+    #[serde(default = "default_ratelimit_max")]
+    pub max_requests: u64,
+    /// Sliding-window size in seconds.
+    #[serde(default = "default_ratelimit_window")]
+    pub window_secs: u64,
+}
+
+impl Default for Ratelimit {
+    fn default() -> Ratelimit {
+        default_ratelimit()
+    }
+}
+
+fn default_ratelimit_enabled() -> bool {
+    true
+}
+fn default_ratelimit_max() -> u64 {
+    600
+}
+fn default_ratelimit_window() -> u64 {
+    60
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Peer {
     pub name: String,
@@ -96,6 +129,7 @@ impl Default for Config {
                 sync_interval_secs: default_sync_interval(),
                 durable_writes: false,
                 gc_interval_secs: default_gc_interval(),
+                ratelimit: default_ratelimit(),
                 tls: None,
                 l3: L3 { default_quota: default_quota() },
             },
@@ -116,6 +150,7 @@ impl Default for Node {
             sync_interval_secs: default_sync_interval(),
             durable_writes: false,
             gc_interval_secs: default_gc_interval(),
+            ratelimit: default_ratelimit(),
             tls: None,
             l3: L3 { default_quota: default_quota() },
         }
@@ -145,6 +180,13 @@ fn default_sync_interval() -> u64 {
 }
 fn default_gc_interval() -> u64 {
     0
+}
+fn default_ratelimit() -> Ratelimit {
+    Ratelimit {
+        enabled: default_ratelimit_enabled(),
+        max_requests: default_ratelimit_max(),
+        window_secs: default_ratelimit_window(),
+    }
 }
 fn default_listen() -> String {
     "127.0.0.1:8848".to_string()
@@ -182,6 +224,32 @@ impl Config {
 
     pub fn peer(&self, name: &str) -> Option<&Peer> {
         self.peers.iter().find(|p| p.name == name)
+    }
+
+    /// Add a peer (name + libp2p multiaddr). Errors if the name already exists.
+    pub fn add_peer(&mut self, name: &str, addr: &str) -> Result<(), String> {
+        if self.peer(name).is_some() {
+            return Err(format!("peer {name:?} already exists"));
+        }
+        match addr.to_string().parse::<libp2p::Multiaddr>() {
+            Ok(_) => {}
+            Err(_) => return Err(format!("invalid peer addr {addr:?}")),
+        }
+        self.peers.push(Peer { name: name.to_string(), addr: addr.to_string(), pin: "".to_string() });
+        Ok(())
+    }
+
+    /// Remove a peer by name. Returns true if it was present.
+    pub fn remove_peer(&mut self, name: &str) -> bool {
+        let before = self.peers.len();
+        let mut keep: Vec<Peer> = Vec::new();
+        for p in self.peers.iter() {
+            if p.name != name {
+                keep.push(p.clone());
+            }
+        }
+        self.peers = keep;
+        self.peers.len() != before
     }
 }
 

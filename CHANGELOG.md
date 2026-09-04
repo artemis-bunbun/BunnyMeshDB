@@ -47,6 +47,12 @@ binaries for x86_64 and aarch64.
   append before acknowledging — the durability toggle for the no-per-record-
   fsync fast path.
 - **Metrics**: `GET /metrics` — requests, writes, namespaces (lock-free).
+- **Rate limiting**: on by default — `node.ratelimit = { enabled, max_requests,
+  window_secs }` (600 req/token/60s default), 429 on breach, disable with
+  `enabled = false`. Protected routes only (`/healthz`,`/metrics` open).
+- **Live peer management**: `GET|POST /l1/peers`, `DELETE /l1/peers/{name}`
+  — persists to the config file (shared `Arc<Mutex<Config>>` with the mesh
+  engine, so edits reach the engine's next kick without a restart).
 - **Auto-compact/TTL GC**: `node.gc_interval_secs` runs log compaction +
   expiry GC on a live daemon for standalone nodes (same safety guard as the
   CLI). Online mesh-node compaction deliberately deferred — it needs protocol

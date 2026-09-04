@@ -166,7 +166,15 @@ See `sdk/README.md` for the full surface.
   (compaction is only safe single-node; online mesh GC needs protocol
   fencing). Sequence numbers restart at 1.
 - Config: `node.durable_writes` (fsync every write), `node.sync_interval_secs`
-  (mesh pull cadence), `node.gc_interval_secs` (auto-compact cadence, 0 off).
+  (mesh pull cadence), `node.gc_interval_secs` (auto-compact cadence, 0 off),
+  `node.ratelimit` (on by default; disable with `{ enabled = false }`).
+
+## Docs
+
+- `docs/ARCHITECTURE.md` — storage, log, auth, mesh, sessions, L3.
+- `docs/API.md` — full HTTP API reference (all routes, verbs, payloads).
+- `docs/COMPARISON.md` — bunnymeshdb vs. SQLite/sync, CouchDB, Redis, hosted.
+- `sdk/README.md` — full SDK surface.
 
 ## Documented performance
 

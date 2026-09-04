@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod tls;
+pub mod ratelimit;
 
 use crate::caps::{Capability, PermSet, RevocationSet, Scope, Tier, TokenCache};
 use crate::core::hlc::Hlc;
@@ -9,18 +10,21 @@ use crate::core::ident::{Keypair, PublicKey};
 use crate::ns::{account_write, authorize_cached, ensure_l3_namespace, CapCache};
 use crate::query::{QueryCtx, eval};
 use crate::schema::{check_supported, validate_schema};
+use crate::server::ratelimit::RateLimiter;
 use crate::storage::{ConflictPolicy, Entry, StorageError, Store, Version};
+use crate::server::config::Config;
 use crate::util::{b64_encode, b64url_decode};
 use axum::extract::{Extension, Path, Query as AxumQuery, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value as JValue};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use parking_lot::RwLock as PLRwLock;
 use std::sync::Arc;
 
@@ -49,6 +53,12 @@ pub struct AppState {
     pub token_cache: Arc<TokenCache>,
     /// Runtime counters for `/metrics`.
     pub metrics: Arc<Metrics>,
+    /// Request rate limiter (per capability token; on by default).
+    pub ratelimiter: Arc<RateLimiter>,
+    /// Shared runtime config (same Arc the mesh engine holds), for live peer
+    /// management via the admin API. Mutations are saved to `config_path`.
+    pub config: Arc<parking_lot::Mutex<Config>>,
+    pub config_path: PathBuf,
 }
 
 impl AppState {
@@ -124,6 +134,20 @@ pub async fn auth_mw(
     next: Next,
 ) -> Response {
     state.metrics.bump_requests();
+    // Rate limit by capability token digest (or a shared anon bucket for
+    // unauthenticated requests). On by default; 429 on breach.
+    let now = now_ms();
+    let key = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| {
+            let d = crate::caps::token_digest(h);
+            hex::encode(d)
+        })
+        .unwrap_or("anon".into());
+    if !state.ratelimiter.allow(&key, now) {
+        return err_json(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
     let header = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     match header {
         None => {
@@ -347,6 +371,83 @@ async fn l1_create_namespace(
         }
     }
 }
+
+// ---------- live peer management (admin) ----------
+
+/// GET /l1/peers — list configured peers (name, addr, TOFU pin).
+async fn l1_peers_list(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+) -> Response {
+    match auth_l1_l2(&state, caps.as_ref(), &l1_scope(&state), PermSet::ADMIN, now_ms()) {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let cfg = state.config.lock();
+    let peers: Vec<JValue> = cfg
+        .peers.iter()
+        .map(|p| json!({ "name": p.name, "addr": p.addr, "pin": p.pin }))
+        .collect::<Vec<_>>();
+    Json(json!({ "peers": peers })).into_response()
+}
+
+#[derive(Deserialize)]
+struct AddPeerBody {
+    name: String,
+    addr: String,
+}
+
+/// POST /l1/peers — add a peer (persisted to config; picked up by the mesh
+/// engine on its next kick). Body: `{ "name", "addr" }`.
+async fn l1_peers_add(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Json(body): Json<AddPeerBody>,
+) -> Response {
+    match auth_l1_l2(&state, caps.as_ref(), &l1_scope(&state), PermSet::ADMIN, now_ms()) {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let mut cfg = state.config.lock();
+    match cfg.add_peer(&body.name, &body.addr) {
+        Ok(()) => {}
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, format!("{e}").as_str()),
+    }
+    let path = &state.config_path;
+    match cfg.save(&*path) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => {
+            tracing::error!(%e, "save config (add peer)");
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, "config_save_failed")
+        }
+    }
+}
+
+/// DELETE /l1/peers/{name} — remove a configured peer.
+async fn l1_peers_remove(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(name): Path<String>,
+) -> Response {
+    match auth_l1_l2(&state, caps.as_ref(), &l1_scope(&state), PermSet::ADMIN, now_ms()) {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let mut cfg = state.config.lock();
+    if !cfg.remove_peer(&name) {
+        return err_json(StatusCode::NOT_FOUND, "peer_not_found");
+    }
+    let path = &state.config_path;
+    match cfg.save(&*path) {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(e) => {
+            tracing::error!(%e, "save config (remove peer)");
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, "config_save_failed")
+        }
+    }
+}
+
+// ---------- capability issuance ----------
 
 #[derive(Deserialize)]
 struct IssueCapBody {
@@ -1084,6 +1185,8 @@ pub fn app(state: AppState) -> Router {
         .route("/l1/namespaces", get(l1_list_namespaces).post(l1_create_namespace))
         .route("/l1/namespaces/{ns}/schema", get(l1_schema_get).post(l1_schema_set).delete(l1_schema_clear))
         .route("/l1/caps", get(l1_list_caps).post(l1_issue_cap))
+        .route("/l1/peers", get(l1_peers_list).post(l1_peers_add))
+        .route("/l1/peers/{name}", delete(l1_peers_remove))
         .route("/l1/revoke", post(l1_revoke))
         .route("/l2/{ns}", get(l2_scan))
         .route("/l3/u/{pk}", get(l3_scan))

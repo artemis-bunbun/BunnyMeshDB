@@ -122,6 +122,18 @@ await db.put("k3", "after-resume");
 await eventually(() => Promise.resolve(evs2.some((e) => e.seq === (head?.seq ?? 0) + 1)), "resume skips backlog", 8000);
 ok("subscribe since=head skips backlog", true, `got seqs ${evs2.map((e) => e.seq).join(",")}`);
 
+// live peer management (admin) — must persist in config + list + remove
+const H = { Authorization: `Bearer ${adminCap}`, "Content-Type": "application/json" };
+const addRes = await fetch(base + "/l1/peers", { method: "POST", headers: H, body: JSON.stringify({ name: "peer-x.test", addr: "/ip4/127.0.0.1/tcp/9999" }) });
+ok("peer add ok", addRes.ok, String(addRes.status));
+const addBad = await fetch(base + "/l1/peers", { method: "POST", headers: H, body: JSON.stringify({ name: "bad", addr: "nope" }) });
+ok("peer add invalid addr -> 400", addBad.status === 400);
+const listRes = await fetch(base + "/l1/peers", { headers: H });
+const peers = (await listRes.json()).peers ?? [];
+ok("peer list contains added", peers.some((p) => p.name === "peer-x.test"));
+const delRes = await fetch(base + "/l1/peers/peer-x.test", { method: "DELETE", headers: H });
+ok("peer remove ok", delRes.ok);
+
 try { proc.kill("SIGKILL"); } catch {}
 // The SIGKILL below tears down the open SSE subscriptions; the reconnect
 // loop may reject with a transport error. Swallow + short-circuit so the
