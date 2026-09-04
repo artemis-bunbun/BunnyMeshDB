@@ -179,7 +179,7 @@ impl MeshFs {
             rid_arr.copy_from_slice(&rid);
         }
         store
-            .put(&self.ns, &Self::key_of(path), &data, hlc, rid_arr, rid_arr)
+            .put(&self.ns, &Self::key_of(path), &data, hlc, rid_arr, rid_arr, 0)
             .map(|_| ())
             .map_err(|_| std::io::Error::from_raw_os_error(L_ENOSPC))
     }
@@ -457,7 +457,7 @@ impl Filesystem for MeshFs {
             if rid.len() == 32 {
                 rid_arr.copy_from_slice(&rid);
             }
-            let _ = store.put(&self.ns, &marker, &[], hlc, rid_arr, rid_arr);
+            let _ = store.put(&self.ns, &marker, &[], hlc, rid_arr, rid_arr, 0);
         }
         let attr = self.attr(&path, true, req.uid(), req.gid());
         reply.entry(&TTL, &attr, fuser::Generation(0));
@@ -550,7 +550,7 @@ impl Filesystem for MeshFs {
                     Some(Entry::Register(_)) => Vec::new(),
                     None => continue,
                 };
-                let _ = store.put(&self.ns, &nk, &val, hlc, rid_arr, rid_arr);
+                let _ = store.put(&self.ns, &nk, &val, hlc, rid_arr, rid_arr, 0);
                 let _ = store.delete(&self.ns, &k, hlc, rid_arr, rid_arr);
             }
         }

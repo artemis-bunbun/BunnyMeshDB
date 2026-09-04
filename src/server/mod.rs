@@ -1,13 +1,14 @@
 //! HTTP API server (axum) — L1 admin, L2/L3 data routes, capability auth.
 
 pub mod config;
+pub mod tls;
 
 use crate::caps::{Capability, PermSet, RevocationSet, Scope, Tier, TokenCache};
 use crate::core::hlc::Hlc;
 use crate::core::ident::{Keypair, PublicKey};
 use crate::ns::{account_write, authorize_cached, ensure_l3_namespace, CapCache};
 use crate::query::{QueryCtx, eval};
-use crate::storage::{ConflictPolicy, Entry, StorageError, Store};
+use crate::storage::{ConflictPolicy, Entry, StorageError, Store, Version};
 use crate::util::{b64_encode, b64url_decode};
 use axum::extract::{Extension, Path, Query as AxumQuery, State};
 use axum::http::{HeaderMap, Method, StatusCode};
@@ -180,14 +181,43 @@ fn policy_str(p: ConflictPolicy) -> &'static str {
     }
 }
 
-fn latest_value(e: &Entry) -> Option<Vec<u8>> {
+/// Wall-clock expiry of the winning version (0 = never). Purely advisory —
+/// GET/scan treat an expired value as absent.
+fn entry_expires_at(e: &Entry) -> u64 {
     match e {
-        Entry::Lww(v) => Some(v.value.clone()),
+        Entry::Lww(v) => v.expires_at,
         Entry::Register(vs) => vs
             .iter()
             .max_by(|a, b| (a.hlc, a.replica).cmp(&(b.hlc, b.replica)))
+            .map(|v| v.expires_at)
+            .unwrap_or(0),
+    }
+}
+
+/// Latest value, unless the winning version is past its TTL (`now` wall-clock
+/// ms), in which case the key reads as absent.
+fn latest_value(e: &Entry, now: u64) -> Option<Vec<u8>> {
+    match e {
+        Entry::Lww(v) if v.expires_at == 0 || v.expires_at > now => Some(v.value.clone()),
+        Entry::Lww(_) => None,
+        Entry::Register(vs) => vs
+            .iter()
+            .filter(|v| v.expires_at == 0 || v.expires_at > now)
+            .max_by(|a, b| (a.hlc, a.replica).cmp(&(b.hlc, b.replica)))
             .map(|v| v.value.clone()),
     }
+}
+
+/// Raw version descriptor for `/conflicts` and `?versions=true` — exposes
+/// every replica's divergent value, not just the winning one.
+fn version_json(v: &Version) -> JValue {
+    json!({
+        "hlc": v.hlc,
+        "replica": hex::encode(&v.replica),
+        "seq": v.seq,
+        "expires_at": v.expires_at,
+        "value_b64": b64_encode(&v.value),
+    })
 }
 
 /// Build the requested scope for a data route: host/<tier>/<ns>[/dir-prefix].
@@ -446,12 +476,15 @@ fn handle_scan(state: &AppState, caps: Option<&AuthCaps>, ns: &str, query: HashM
     }
     let store = state.store.read();
     let rows = store.scan(ns, p.as_bytes());
+    let now = now_ms();
     let entries: Vec<JValue> = rows
         .into_iter()
+        .filter(|(_, e)| latest_value(e, now).is_some())
         .map(|(k, e)| {
             json!({
                 "key": String::from_utf8_lossy(&k),
-                "value_b64": b64_encode(&latest_value(&e).unwrap_or_default()),
+                "value_b64": b64_encode(&latest_value(&e, now).unwrap_or_default()),
+                "expires_at": entry_expires_at(&e),
             })
         })
         .collect();
@@ -477,20 +510,41 @@ fn handle_data(
             if let Some(p) = query.get("prefix") {
                 let store = state.store.read();
                 let rows = store.scan(ns, p.as_bytes());
+                let now = now_ms();
                 let entries: Vec<JValue> = rows
                     .into_iter()
+                    .filter(|(_, e)| latest_value(e, now).is_some())
                     .map(|(k, e)| {
                         json!({
                             "key": String::from_utf8_lossy(&k),
-                            "value_b64": b64_encode(&latest_value(&e).unwrap_or_default()),
+                            "value_b64": b64_encode(&latest_value(&e, now).unwrap_or_default()),
+                            "expires_at": entry_expires_at(&e),
                         })
                     })
                     .collect();
                 Json(json!({ "entries": entries })).into_response()
-            } else {
+            } else if query.get("versions").map(|v| v == "true").unwrap_or(false) {
+                // Raw-version read: expose every divergent version on the key
+                // (Register policy) instead of the winning value.
                 let store = state.store.read();
                 match store.get(ns, &k) {
-                    Some(e) => latest_value(e)
+                    Some(Entry::Lww(v)) => Json(json!({
+                        "key": String::from_utf8_lossy(&k),
+                        "versions": [version_json(v)],
+                    }))
+                    .into_response(),
+                    Some(Entry::Register(vs)) => Json(json!({
+                        "key": String::from_utf8_lossy(&k),
+                        "versions": vs.iter().map(version_json).collect::<Vec<_>>(),
+                    }))
+                    .into_response(),
+                    None => err_json(StatusCode::NOT_FOUND, "not_found"),
+                }
+            } else {
+                let store = state.store.read();
+                let now = now_ms();
+                match store.get(ns, &k) {
+                    Some(e) => latest_value(e, now)
                         .map(|v| v.into_response())
                         .unwrap_or_else(|| err_json(StatusCode::NOT_FOUND, "not_found")),
                     None => err_json(StatusCode::NOT_FOUND, "not_found"),
@@ -511,11 +565,17 @@ fn handle_data(
             }
             let hlc = Hlc::now().to_u64();
             let rid = state.root.to_bytes();
-            match store.put(ns, &k, body, hlc, rid, principal.to_bytes()) {
+            // `?ttl=<secs>` sets a wall-clock expiry (0/absent = never).
+            // Overflow on absurd values merely wraps → value reads already-expired.
+            let expires_at = match query.get("ttl").and_then(|s| s.parse::<u64>().ok()) {
+                Some(secs) if secs > 0 => now_ms() + secs * 1000,
+                _ => 0,
+            };
+            match store.put(ns, &k, body, hlc, rid, principal.to_bytes(), expires_at) {
                 Ok(seq) => {
                     drop(store);
                     state.notify_sync();
-                    Json(json!({ "ok": true, "seq": seq })).into_response()
+                    Json(json!({ "ok": true, "seq": seq, "expires_at": expires_at })).into_response()
                 }
                 Err(e) => {
                     tracing::error!(%e, "put");
@@ -593,6 +653,180 @@ async fn ql_l3(
     run_ql(&state, None, &format!("u/{pk}"), &body.expr)
 }
 
+// ---------- change feed ----------
+
+/// GET /l2/{ns}/head — namespace log head (seq + chain hash). Poll or change
+/// events against this to detect new writes without pulling the whole feed.
+async fn l2_head(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+) -> Response {
+    match data_auth(&state, caps.as_ref(), &ns, "") {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let store = state.store.read();
+    match store.head(&ns) {
+        Some((seq, h)) => Json(json!({ "seq": seq, "hash": hex::encode(&h) })).into_response(),
+        None => err_json(StatusCode::NOT_FOUND, "namespace_not_found"),
+    }
+}
+
+/// GET /l2/{ns}/changes?since=<seq> — log records after `since`, oldest
+/// first. Each change is one durable record (PUT / DEL / TTL). Polling with
+/// `since` = the previous response's `head.seq` yields a gapless stream.
+async fn l2_changes(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+    query: AxumQuery<HashMap<String, String>>,
+) -> Response {
+    match data_auth(&state, caps.as_ref(), &ns, "") {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let since = query.0.get("since").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let store = state.store.read();
+    if store.policy(&ns).is_none() {
+        return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
+    }
+    let head = store.head(&ns).map(|(seq, h)| json!({ "seq": seq, "hash": hex::encode(&h) })).unwrap_or(JValue::Null);
+    let changes: Vec<JValue> = match store.log_records(&ns, since + 1) {
+        Ok(recs) => recs
+            .into_iter()
+            .map(|(seq, bytes)| {
+                match crate::storage::log::Record::parse_chain(&bytes, None) {
+                    Ok((rec, _)) => json!({
+                        "seq": seq,
+                        "key_b64": b64_encode(&rec.key),
+                        "value_b64": b64_encode(&rec.value),
+                        "del": rec.tag == crate::storage::log::TAG_DEL,
+                        "ttl": rec.expires_at != 0,
+                        "expires_at": rec.expires_at,
+                        "hlc": rec.hlc,
+                    }),
+                    Err(_) => json!({ "seq": seq, "parse_error": true }),
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    Json(json!({ "since": since, "head": head, "changes": changes })).into_response()
+}
+
+/// L3 owner-namespace variants (no capability — identity is the namespace).
+async fn l3_head(
+    State(state): State<AppState>,
+    Extension(_caps): Extension<Option<AuthCaps>>,
+    Path(pk): Path<String>,
+) -> Response {
+    let ns = format!("u/{pk}");
+    match data_auth(&state, None, &ns, "") {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let store = state.store.read();
+    match store.head(&ns) {
+        Some((seq, h)) => Json(json!({ "seq": seq, "hash": hex::encode(&h) })).into_response(),
+        None => err_json(StatusCode::NOT_FOUND, "namespace_not_found"),
+    }
+}
+
+async fn l3_changes(
+    State(state): State<AppState>,
+    Extension(_caps): Extension<Option<AuthCaps>>,
+    Path(pk): Path<String>,
+    query: AxumQuery<HashMap<String, String>>,
+) -> Response {
+    let ns = format!("u/{pk}");
+    match data_auth(&state, None, &ns, "") {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let since = query.0.get("since").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let store = state.store.read();
+    if store.policy(&ns).is_none() {
+        return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
+    }
+    let head = store.head(&ns).map(|(seq, h)| json!({ "seq": seq, "hash": hex::encode(&h) })).unwrap_or(JValue::Null);
+    let changes: Vec<JValue> = match store.log_records(&ns, since + 1) {
+        Ok(recs) => recs
+            .into_iter()
+            .map(|(seq, bytes)| {
+                match crate::storage::log::Record::parse_chain(&bytes, None) {
+                    Ok((rec, _)) => json!({
+                        "seq": seq,
+                        "key_b64": b64_encode(&rec.key),
+                        "value_b64": b64_encode(&rec.value),
+                        "del": rec.tag == crate::storage::log::TAG_DEL,
+                        "ttl": rec.expires_at != 0,
+                        "expires_at": rec.expires_at,
+                        "hlc": rec.hlc,
+                    }),
+                    Err(_) => json!({ "seq": seq, "parse_error": true }),
+                }
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    Json(json!({ "since": since, "head": head, "changes": changes })).into_response()
+}
+
+// ---------- conflict observation ----------
+
+/// GET /l2/{ns}/conflicts — every Register-policy key holding >1
+/// concurrent version (divergent replicas that LWW-style reads silently
+/// collapse). Exposes each divergent value so clients can reconcile.
+async fn l2_conflicts(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+) -> Response {
+    match data_auth(&state, caps.as_ref(), &ns, "") {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let store = state.store.read();
+    let mut out: Vec<JValue> = Vec::new();
+    for (k, e) in store.scan(&ns, b"") {
+        match e {
+            Entry::Register(vs) if vs.len() > 1 => out.push(json!({
+                "key": String::from_utf8_lossy(&k),
+                "count": vs.len(),
+                "versions": vs.iter().map(version_json).collect::<Vec<_>>(),
+            })),
+            _ => {}
+        }
+    }
+    Json(json!({ "conflicts": out })).into_response()
+}
+
+async fn l3_conflicts(
+    State(state): State<AppState>,
+    Extension(_caps): Extension<Option<AuthCaps>>,
+    Path(pk): Path<String>,
+) -> Response {
+    let ns = format!("u/{pk}");
+    match data_auth(&state, None, &ns, "") {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let store = state.store.read();
+    let mut out: Vec<JValue> = Vec::new();
+    for (k, e) in store.scan(&ns, b"") {
+        match e {
+            Entry::Register(vs) if vs.len() > 1 => out.push(json!({
+                "key": String::from_utf8_lossy(&k),
+                "count": vs.len(),
+                "versions": vs.iter().map(version_json).collect::<Vec<_>>(),
+            })),
+            _ => {}
+        }
+    }
+    Json(json!({ "conflicts": out })).into_response()
+}
+
 // ---------- router ----------
 
 pub fn app(state: AppState) -> Router {
@@ -606,6 +840,12 @@ pub fn app(state: AppState) -> Router {
         .route("/l3/u/{pk}/{*key}", get(l3_data).put(l3_data).delete(l3_data))
         .route("/l2/{ns}/ql", post(ql_l2))
         .route("/l3/u/{pk}/ql", post(ql_l3))
+        .route("/l2/{ns}/head", get(l2_head))
+        .route("/l2/{ns}/changes", get(l2_changes))
+        .route("/l3/u/{pk}/head", get(l3_head))
+        .route("/l3/u/{pk}/changes", get(l3_changes))
+        .route("/l2/{ns}/conflicts", get(l2_conflicts))
+        .route("/l3/u/{pk}/conflicts", get(l3_conflicts))
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .with_state(state.clone());
     Router::new()

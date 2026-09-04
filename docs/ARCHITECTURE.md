@@ -105,3 +105,35 @@ Every write is a record:
 2. Capability verification + L3 sandbox API (https scheme) — multi-user
 3. Merkle log + peer sync (libp2p) — the mesh is real at this point
 4. L3-as-filesystem (FUSE) on top of the synced KV
+
+## 9. Production features (HTTP API)
+
+Additive surface on the existing L1/L2/L3 routes; none change the wire
+record format or the sync protocol.
+
+- **TLS termination** (`[node.tls]` in `config.toml`: `cert_path` +
+  `key_path`, PEM). axum serves over a `tokio-rustls` listener; capability
+  tokens and payloads are then encrypted on the wire. Capability auth stays
+  the application boundary — TLS is transport defense-in-depth. Fails fast on
+  missing/mismatched keys.
+- **Value TTL** — `PUT /l2/{ns}/{key}?ttl=<secs>` records a wall-clock
+  expiry as a new log tag (`TAG_PUT_TTL`), replicated alongside the value.
+  GET/scan treat an expired value as absent; expiry survives offline nodes
+  (each replica enforces it locally), unlike single-node Redis TTL. Record
+  layout for ordinary PUT/DEL is unchanged; snapshots bump `BMDBIDX1` →
+  `BMDBIDX2` with a trailing `expires_at` (v1 snapshots load transparently).
+- **Change feed** — `GET /l2/{ns}/changes?since=<seq>` returns a gapless,
+  lowest-seq-first stream of durable log records (PUT/DEL/TTL), plus the
+  namespace `head`; `GET /l2/{ns}/head` returns `{seq, hash}` for cheap
+  long-poll. Poll with `since` = previous `head.seq`.
+- **Conflict observability** — register-policy namespaces keep every
+  concurrent version. `GET /l2/{ns}/{key}?versions=true` exposes them raw;
+  `GET /l2/{ns}/conflicts` lists every key holding >1 version. This turns
+  divergent-history CRDT data into something a client can see and reconcile.
+- **Backup / restore** — `bunny backup <data> --out <dir>` checkpoints the
+  store then copies the data dir (root private key written 0600);
+  `bunny restore <backup> --data-dir <dir>` copies it back into a fresh
+  node dir. Byte-identical `meta.bin` ⇒ restored node keeps its identity.
+- Known quirk: data routes require a cap carrying `read|write` regardless of
+  method (pre-existing; a read-only cap cannot GET). Not part of this
+  change — flagged for a follow-up.

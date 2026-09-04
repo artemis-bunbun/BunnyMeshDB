@@ -29,6 +29,8 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "time", "mac
 toml = "1.1.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tokio-rustls = "0.26.5"
+rustls-pemfile = "1.0.1"
 
 [features]
 mimalloc = ["dep:mimalloc"]

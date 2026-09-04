@@ -138,7 +138,7 @@ fn exec(ctx: &mut QueryCtx, call: &Call) -> Result<Value, QueryError> {
             let val = str_arg(ctx, &call.args[1])?.into_bytes();
             let hlc = Hlc::now().to_u64();
             let rid = ctx.host_id.to_bytes();
-            ctx.store.put(&ns, &key, &val, hlc, rid, rid)?;
+            ctx.store.put(&ns, &key, &val, hlc, rid, rid, 0)?;
             Ok(Value::Bool(true))
         }
         "del" => {

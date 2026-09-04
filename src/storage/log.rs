@@ -5,12 +5,14 @@
 //!
 //! Record layout:
 //! ```text
-//! tag:u8 (0x01 PUT | 0x02 DEL)
+//! tag:u8 (0x01 PUT | 0x02 DEL | 0x03 PUT_TTL)
 //! len:u32 (payload length, bytes after crc32 field)
 //! crc32:u32 over bytes [tag .. end of payload] (IEEE 802.3, hand-rolled table)
 //! prev:[u8;32] sha256 of previous record's full bytes; first = 32×0x00
 //! payload: key_len:u32 | key | hlc:u64 | replica:[u8;32] | author:[u8;32]
 //!          | val_len:u64 | value (val_len 0 for DEL)
+//! PUT_TTL (0x03) adds a trailing expires_at:u64 (wall-clock ms; 0 = never)
+//! after value — PUT/DEL payload layout is unchanged so old logs still parse.
 //! ```
 //!
 //! Record hash = `sha256(prev || full_record_bytes)`; namespace head =
@@ -28,6 +30,9 @@ use std::sync::OnceLock;
 
 pub const TAG_PUT: u8 = 0x01;
 pub const TAG_DEL: u8 = 0x02;
+/// PUT with a TTL: value is invalid after `expires_at` wall-clock ms.
+/// Same layout as TAG_PUT plus a trailing expires_at:u64 (0 = never).
+pub const TAG_PUT_TTL: u8 = 0x03;
 /// 64 MiB segment roll threshold.
 pub const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -51,6 +56,8 @@ pub struct Record {
     pub author: [u8; 32],
     /// Empty for DEL.
     pub value: Vec<u8>,
+    /// Wall-clock expiry ms for TAG_PUT_TTL; 0 = never. Always 0 for PUT/DEL.
+    pub expires_at: u64,
 }
 
 impl Record {
@@ -58,7 +65,8 @@ impl Record {
     pub fn to_bytes(&self, prev: [u8; 32]) -> Vec<u8> {
         let key_len = self.key.len() as u32;
         let val_len = self.value.len() as u64;
-        let payload_len = 4 + key_len as usize + 8 + 32 + 32 + 8 + val_len as usize;
+        let ttl = if self.tag == TAG_PUT_TTL { 8 } else { 0 };
+        let payload_len = 4 + key_len as usize + 8 + 32 + 32 + 8 + val_len as usize + ttl;
         let mut out = Vec::with_capacity(HEADER_LEN + payload_len);
         out.push(self.tag);
         out.extend_from_slice(&(payload_len as u32).to_le_bytes());
@@ -72,6 +80,9 @@ impl Record {
         out.extend_from_slice(&self.author);
         out.extend_from_slice(&val_len.to_le_bytes());
         out.extend_from_slice(&self.value);
+        if ttl != 0 {
+            out.extend_from_slice(&self.expires_at.to_le_bytes());
+        }
         let crc = crc32_parts(&out[..1], &out[9..]);
         out[5..9].copy_from_slice(&crc.to_le_bytes());
         out
@@ -95,7 +106,7 @@ impl Record {
             return Err(StorageError::Corrupt { ns: None, detail: "record shorter than header".into() });
         }
         let tag = bytes[0];
-        if tag != TAG_PUT && tag != TAG_DEL {
+        if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL {
             return Err(StorageError::Corrupt { ns: None, detail: format!("bad record tag {tag:#x}") });
         }
         let declared_len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
@@ -148,7 +159,16 @@ impl Record {
             return Err(StorageError::Corrupt { ns: None, detail: "val_len overruns".into() });
         }
         let value = bytes[p..p + val_len].to_vec();
-        Ok((Record { tag, key, hlc, replica, author, value }, prev))
+        p += val_len;
+        let expires_at = if tag == TAG_PUT_TTL {
+            if p + 8 > bytes.len() {
+                return Err(StorageError::Corrupt { ns: None, detail: "expires_at overruns".into() });
+            }
+            u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap())
+        } else {
+            0
+        };
+        Ok((Record { tag, key, hlc, replica, author, value, expires_at }, prev))
     }
 
     /// sha256(prev || full_record_bytes) — the chain link.
@@ -277,7 +297,7 @@ impl Log {
                     break 'segments;
                 }
                 let tag = buf[pos];
-                if tag != TAG_PUT && tag != TAG_DEL {
+                if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL {
                     // A bad tag is never a clean torn write end; refuse.
                     return Err(StorageError::Corrupt {
                         ns: Some(ns_from_dir(dir)),
@@ -469,6 +489,7 @@ mod tests {
             replica: [7u8; 32],
             author: [9u8; 32],
             value: value.to_vec(),
+            expires_at: 0,
         }
     }
 

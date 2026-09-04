@@ -33,8 +33,22 @@ pub struct Node {
     /// this node's log.
     #[serde(default = "default_mesh_sync")]
     pub mesh_sync: bool,
+    /// Optional TLS termination. When both `cert_path` (PEM cert chain) and
+    /// `key_path` (PEM private key) are set, the HTTP API is served over
+    /// TLS — capability tokens in flight are then encrypted at the transport
+    /// layer (defense-in-depth; capability auth is still the app boundary).
+    #[serde(default)]
+    pub tls: Option<Tls>,
     #[serde(default)]
     pub l3: L3,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Tls {
+    /// Path to a PEM certificate chain (leaf first).
+    pub cert_path: String,
+    /// Path to the matching PEM private key (PKCS#8 / SEC1 / PKCS#1).
+    pub key_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -62,6 +76,7 @@ impl Default for Config {
                 p2p_listen: default_p2p_listen(),
                 worker_threads: default_workers(),
                 mesh_sync: default_mesh_sync(),
+                tls: None,
                 l3: L3 { default_quota: default_quota() },
             },
             peers: Vec::new(),
@@ -78,6 +93,7 @@ impl Default for Node {
             p2p_listen: default_p2p_listen(),
             worker_threads: default_workers(),
             mesh_sync: default_mesh_sync(),
+            tls: None,
             l3: L3 { default_quota: default_quota() },
         }
     }

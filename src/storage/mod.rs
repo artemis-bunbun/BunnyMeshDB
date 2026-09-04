@@ -7,7 +7,7 @@
 
 pub mod log;
 
-use crate::storage::log::{Log, RecoverWarning, Record, TAG_DEL, TAG_PUT};
+use crate::storage::log::{Log, RecoverWarning, Record, TAG_DEL, TAG_PUT, TAG_PUT_TTL};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -96,6 +96,9 @@ pub struct Version {
     pub author: [u8; 32],
     pub value: Vec<u8>,
     pub seq: u64,
+    /// Wall-clock expiry ms; 0 = never. TTL is a read-time filter — expired
+    /// entries are retained in the index/log (like deletes) until compaction.
+    pub expires_at: u64,
 }
 
 /// Index entry, shaped by the namespace's conflict policy.
@@ -113,7 +116,9 @@ pub enum ConflictPolicy {
     CrdtRegister,
 }
 
-const SNAP_MAGIC: &[u8; 8] = b"BMDBIDX1";
+const SNAP_MAGIC: &[u8; 8] = b"BMDBIDX2";
+/// v1 (pre-TTL) snapshot — accepted on load for rolling upgrade.
+const SNAP_MAGIC_V1: &[u8; 8] = b"BMDBIDX1";
 const POLICY_SIDECAR: &str = "policy.bin";
 
 /// Little-endian binary writer.
@@ -220,8 +225,10 @@ fn write_version(w: &mut W, v: &Version) {
     w.fixed(&v.author);
     w.bytes(&v.value);
     w.u64(v.seq);
+    w.u64(v.expires_at);
 }
 
+/// Read a v2 snapshot version (with `expires_at`).
 fn read_version(r: &mut R) -> Result<Version, StorageError> {
     Ok(Version {
         hlc: r.u64()?,
@@ -229,6 +236,19 @@ fn read_version(r: &mut R) -> Result<Version, StorageError> {
         author: r.fixed32()?,
         value: r.bytes()?,
         seq: r.u64()?,
+        expires_at: r.u64()?,
+    })
+}
+
+/// Read a v1 (pre-TTL) snapshot version — no trailing `expires_at`.
+fn read_version_v1(r: &mut R) -> Result<Version, StorageError> {
+    Ok(Version {
+        hlc: r.u64()?,
+        replica: r.fixed32()?,
+        author: r.fixed32()?,
+        value: r.bytes()?,
+        seq: r.u64()?,
+        expires_at: 0,
     })
 }
 
@@ -361,9 +381,26 @@ impl Store {
     }
 
     fn load_snap(&mut self, bytes: &[u8], snap_info: &mut BTreeMap<Namespace, (u64, [u8; 32])>) -> Result<(), StorageError> {
-        if bytes.len() < 8 || &bytes[..8] != SNAP_MAGIC {
+        if bytes.len() < 8 {
+            return Err(StorageError::Corrupt { ns: None, detail: "index.snap too short".into() });
+        }
+        // Accept v1 (pre-TTL) and v2 snapshots; v1 versions have no
+        // expires_at → read with the legacy parser (expires 0).
+        let v1 = &bytes[..8] == SNAP_MAGIC_V1;
+        if !v1 && &bytes[..8] != SNAP_MAGIC {
             return Err(StorageError::Corrupt { ns: None, detail: "index.snap magic mismatch".into() });
         }
+        let read_v = if v1 {
+            fn f(r: &mut R) -> Result<Version, StorageError> {
+                read_version_v1(r)
+            }
+            f
+        } else {
+            fn f(r: &mut R) -> Result<Version, StorageError> {
+                read_version(r)
+            }
+            f
+        };
         let mut r = R::new(&bytes[8..]);
         self.revision = r.u64()?;
         let meta_count = r.u32()?;
@@ -389,12 +426,12 @@ impl Store {
                 let key = r.bytes()?;
                 let tag = r.u8()?;
                 let entry = match tag {
-                    0 => Entry::Lww(read_version(&mut r)?),
+                    0 => Entry::Lww(read_v(&mut r)?),
                     1 => {
                         let n = r.u32()? as usize;
                         let mut vs = Vec::with_capacity(n);
                         for _ in 0..n {
-                            vs.push(read_version(&mut r)?);
+                            vs.push(read_v(&mut r)?);
                         }
                         Entry::Register(vs)
                     }
@@ -464,7 +501,8 @@ impl Store {
     }
 
     /// Put a value; returns the record seq. `hlc` should be observed against
-    /// the store's clock by the caller.
+    /// the store's clock by the caller. `expires_at` (wall-clock ms, 0 =
+    /// never) makes the write a TTL value: invalid after that instant.
     pub fn put(
         &mut self,
         ns: &str,
@@ -473,6 +511,7 @@ impl Store {
         hlc: u64,
         replica: [u8; 32],
         author: [u8; 32],
+        expires_at: u64,
     ) -> Result<u64, StorageError> {
         let policy = *self
             .policies
@@ -483,16 +522,17 @@ impl Store {
             .get_mut(ns)
             .ok_or(StorageError::NotFound(ns.to_string()))?;
         let record = Record {
-            tag: TAG_PUT,
+            tag: if expires_at == 0 { TAG_PUT } else { TAG_PUT_TTL },
             key: key.clone(),
             hlc,
             replica,
             author,
             value: value.to_vec(),
+            expires_at,
         };
         let bytes = record.to_bytes(log.head());
         let seq = log.append(&bytes)?;
-        let version = Version { hlc, replica, author, value: value.to_vec(), seq };
+        let version = Version { hlc, replica, author, value: value.to_vec(), seq, expires_at };
         let entry_key = (ns.to_string(), key.clone());
         // A local write is new user intent: it resurrects the key.
         self.tombs.remove(&entry_key);
@@ -541,6 +581,7 @@ impl Store {
             replica,
             author,
             value: Vec::new(),
+            expires_at: 0,
         };
         let bytes = record.to_bytes(log.head());
         let seq = log.append(&bytes)?;
@@ -669,13 +710,14 @@ impl Store {
             .ok_or_else(|| StorageError::BadName(ns.to_string()))?;
         let entry_key = (ns.to_string(), record.key.clone());
         match record.tag {
-            TAG_PUT => {
+            TAG_PUT | TAG_PUT_TTL => {
                 let version = Version {
                     hlc: record.hlc,
                     replica: record.replica,
                     author: record.author,
                     value: record.value.clone(),
                     seq,
+                    expires_at: record.expires_at,
                 };
                 match policy {
                     ConflictPolicy::Lww => {
@@ -824,10 +866,12 @@ mod tests {
 
     const REP: [u8; 32] = [1u8; 32];
     const AUTH: [u8; 32] = [2u8; 32];
+    /// A second replica id (peer-originated records in TTL-sync tests).
+    const B_REP: [u8; 32] = [3u8; 32];
 
     fn seed(store: &mut Store, ns: &str, key: &str, val: &str, hlc: u64) -> u64 {
         store
-            .put(ns, &key.as_bytes().to_vec(), val.as_bytes(), hlc, REP, AUTH)
+            .put(ns, &key.as_bytes().to_vec(), val.as_bytes(), hlc, REP, AUTH, 0)
             .unwrap()
     }
 
@@ -997,6 +1041,119 @@ mod tests {
         }
         match s.get("n", &b"a".to_vec()).unwrap() {
             Entry::Lww(v) => assert_eq!(v.value, b"1"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn ttl_write_expires_at_roundtrip() {
+        let dir = tmpdir("ttl");
+        let mut s = Store::open(&dir).unwrap();
+        s.create_namespace("n", ConflictPolicy::Lww).unwrap();
+        // A TTL write goes out as a TTL record and carries expires_at.
+        let seq = s.put("n", &b"k".to_vec(), b"v", 100, REP, AUTH, 5000).unwrap();
+        assert!(seq > 0);
+        match s.get("n", &b"k".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.expires_at, 5000),
+            _ => panic!("expected Lww"),
+        }
+        // Log record must parse back as TAG_PUT_TTL with the expiry intact.
+        let recs = s.log_records("n", 1).unwrap();
+        let (seq0, seg0) = (recs[0].0, recs[0].1.clone());
+        let (rec, _) = crate::storage::log::Record::parse_chain(&seg0, None).unwrap();
+        assert_eq!(rec.tag, crate::storage::log::TAG_PUT_TTL);
+        assert_eq!(rec.expires_at, 5000);
+        assert_eq!(seq0, seq);
+        // Non-TTL writes stay TAG_PUT with expires 0.
+        assert!(s.put("n", &b"k2".to_vec(), b"w", 101, REP, AUTH, 0).unwrap() > 0);
+        let recs2 = s.log_records("n", 2).unwrap();
+        let seg1 = recs2[0].1.clone();
+        let (rec2, _) = crate::storage::log::Record::parse_chain(&seg1, None).unwrap();
+        assert_eq!(rec2.tag, crate::storage::log::TAG_PUT);
+        assert_eq!(rec2.expires_at, 0);
+        // Checkpoint + reopen preserves expiry (v2 snapshot).
+        s.checkpoint().unwrap();
+        drop(s);
+        let s2 = Store::open(&dir).unwrap();
+        match s2.get("n", &b"k".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.expires_at, 5000, "expiry survives reopen"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn ttl_synced_record_applies_expiry() {
+        let dir = tmpdir("ttlsync");
+        let mut s = Store::open(&dir).unwrap();
+        s.create_namespace("n", ConflictPolicy::Lww).unwrap();
+        // Simulate a record received over the mesh (apply_synced path).
+        let rec = crate::storage::log::Record {
+            tag: crate::storage::log::TAG_PUT_TTL,
+            key: b"k".to_vec(),
+            hlc: 100,
+            replica: B_REP,
+            author: B_REP,
+            value: b"from-peer".to_vec(),
+            expires_at: 7777,
+        };
+        assert_eq!(s.apply_synced("n", &rec).unwrap(), true);
+        match s.get("n", &b"k".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.expires_at, 7777),
+            _ => panic!(),
+        }
+        assert_eq!(s.apply_synced("n", &rec).unwrap(), false, "dedupe by version");
+    }
+
+    #[test]
+    fn v1_snapshot_rolls_up_with_zero_expiry() {
+        // Hand-write a v1 (pre-TTL) snapshot and confirm it loads with
+        // expires_at == 0 for every version — the rolling-upgrade path.
+        let dir = tmpdir("v1up");
+        {
+            let mut s = Store::open(&dir).unwrap();
+            s.create_namespace("n", ConflictPolicy::Lww).unwrap();
+            seed(&mut s, "n", "a", "1", 1);
+            s.checkpoint().unwrap();
+        }
+        // v1 body: no trailing expires_at in each version. The segment file
+        // holds a whole record stream — extract record 1 by declared length
+        // (header = tag(1) len(4) crc(4) prev(32)) to compute the head hash.
+        let seg = fs::read(ns_dir(&dir, "n").join("log.0.seg")).unwrap();
+        let rec1_len = u32::from_le_bytes(seg[1..5].try_into().unwrap()) as usize;
+        let rec1 = &seg[..41 + rec1_len];
+        let (_v, _prev) = crate::storage::log::Record::parse_chain(rec1, None).unwrap();
+        // Head of a 1-record chain = record_hash([0;32] prev, full record).
+        let stored_head = Record::record_hash(&[0u8; 32], rec1);
+        // Rebuild a minimal v1 snapshot by hand (magic, rev, meta, peers, 1 ns).
+        let mut w = W(Vec::new());
+        w.0.extend_from_slice(&[b'B', b'M', b'D', b'B', b'I', b'D', b'X', b'1']);
+        w.u64(1); // revision
+        w.u32(0); // meta count
+        w.u32(0); // peer clock count
+        w.u32(1); // namespaces
+        w.bytes(b"n");
+        w.u8(policy_to_u8(ConflictPolicy::Lww));
+        w.u64(1); // head seq
+        w.fixed(&stored_head); // head hash of the 1-record chain
+        w.u32(1); // entry count
+        w.bytes(b"a");
+        w.u8(0); // Lww tag
+        w.u64(1); // hlc
+        w.fixed(&[7u8; 32]); // replica
+        w.fixed(&[9u8; 32]); // author
+        w.bytes(b"1");
+        w.u64(1); // seq  (v1: NO trailing expires_at)
+        w.u32(0); // tomb count
+        fs::write(&dir.join("index.snap"), &w.0).unwrap();
+        let s = match Store::open(&dir) {
+            Ok(s) => s,
+            Err(e) => panic!("v1 snapshot open failed: {e:?}"),
+        };
+        match s.get("n", &b"a".to_vec()).unwrap() {
+            Entry::Lww(v) => {
+                assert_eq!(v.value, b"1");
+                assert_eq!(v.expires_at, 0, "v1 snapshot must roll up with no expiry");
+            }
             _ => panic!(),
         }
     }

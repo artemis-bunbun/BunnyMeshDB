@@ -115,7 +115,7 @@ fn dbg_merge_verify() {
     let _ = fs::remove_dir_all(&dir);
     let mut s = crate::storage::Store::open(&dir).unwrap();
     s.create_namespace("n", crate::storage::ConflictPolicy::Lww).unwrap();
-    s.put("n", &b"k".to_vec(), b"v1", 100, [1u8;32], [1u8;32]).unwrap();
+    s.put("n", &b"k".to_vec(), b"v1", 100, [1u8;32], [1u8;32], 0).unwrap();
     let recs = s.log_records("n", 1).unwrap();
     eprintln!("rec count {}", recs.len());
     for (seq, b) in &recs {
@@ -139,8 +139,8 @@ fn dbg_merge_verify() {
         s1.create_namespace("n", ConflictPolicy::Lww).unwrap();
         s2.create_namespace("n", ConflictPolicy::Lww).unwrap();
         // Divergent same-key writes: s1 writes hlc 100, s2 writes hlc 200.
-        s1.put("n", &b"k".to_vec(), b"v1", 100, A, A).unwrap();
-        s2.put("n", &b"k".to_vec(), b"v2", 200, B, B).unwrap();
+        s1.put("n", &b"k".to_vec(), b"v1", 100, A, A, 0).unwrap();
+        s2.put("n", &b"k".to_vec(), b"v2", 200, B, B, 0).unwrap();
         // Bidirectional sync.
         sync_into(&mut s2, &s1, "n");
         sync_into(&mut s1, &s2, "n");
@@ -167,8 +167,8 @@ fn dbg_merge_verify() {
         let mut s2 = Store::open(&d2).unwrap();
         s1.create_namespace("n", ConflictPolicy::CrdtRegister).unwrap();
         s2.create_namespace("n", ConflictPolicy::CrdtRegister).unwrap();
-        s1.put("n", &b"k".to_vec(), b"a", 100, A, A).unwrap();
-        s2.put("n", &b"k".to_vec(), b"b", 100, B, B).unwrap();
+        s1.put("n", &b"k".to_vec(), b"a", 100, A, A, 0).unwrap();
+        s2.put("n", &b"k".to_vec(), b"b", 100, B, B, 0).unwrap();
         sync_into(&mut s2, &s1, "n");
         sync_into(&mut s1, &s2, "n");
         // Both registers hold both replicas.
@@ -193,9 +193,9 @@ fn dbg_merge_verify() {
         s1.create_namespace("n", ConflictPolicy::Lww).unwrap();
         s2.create_namespace("n", ConflictPolicy::Lww).unwrap();
         // s1 writes, then deletes; s2 writes a NEWER version concurrently.
-        s1.put("n", &b"k".to_vec(), b"orig", 100, A, A).unwrap();
+        s1.put("n", &b"k".to_vec(), b"orig", 100, A, A, 0).unwrap();
         s1.delete("n", &b"k".to_vec(), 150, A, A).unwrap();
-        s2.put("n", &b"k".to_vec(), b"later", 200, B, B).unwrap();
+        s2.put("n", &b"k".to_vec(), b"later", 200, B, B, 0).unwrap();
         sync_into(&mut s2, &s1, "n");
         sync_into(&mut s1, &s2, "n");
         // Delete is authoritative: get is Null on both, regardless of the
@@ -217,6 +217,7 @@ fn dbg_merge_verify() {
             replica: A,
             author: A,
             value: b"v".to_vec(),
+            expires_at: 0,
         };
         let bytes = r.to_bytes([0u8; 32]);
         // ...and a corrupt copy (bit flip in value).
@@ -235,10 +236,10 @@ fn dbg_merge_verify() {
     fn batch_with_hlc_reversal_still_verifies() {
         // Interleaved sync arrivals legitimately regress HLC; chain is the
         // integrity boundary.
-        let r1 = Record { tag: TAG_PUT, key: b"a".to_vec(), hlc: 100, replica: A, author: A, value: b"x".to_vec() };
+        let r1 = Record { tag: TAG_PUT, key: b"a".to_vec(), hlc: 100, replica: A, author: A, value: b"x".to_vec(), expires_at: 0 };
         let b1 = r1.to_bytes([0u8; 32]);
         let h1 = Record::record_hash(&[0u8; 32], &b1);
-        let r2 = Record { tag: TAG_PUT, key: b"b".to_vec(), hlc: 50, replica: A, author: A, value: b"y".to_vec() };
+        let r2 = Record { tag: TAG_PUT, key: b"b".to_vec(), hlc: 50, replica: A, author: A, value: b"y".to_vec(), expires_at: 0 };
         let b2 = r2.to_bytes(h1);
         let res = verify_batch([0u8; 32], &[(1, b1), (2, b2)]);
         assert!(res.is_ok(), "{res:?}");

@@ -208,19 +208,37 @@ async fn run(config_path: PathBuf, mount_at: Option<PathBuf>, cfg: Config) {
         }
     });
 
-    let listener = match tokio::net::TcpListener::bind(&cfg.node.listen).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("fatal: bind {}: {e}", cfg.node.listen);
-            std::process::exit(1);
-        }
-    };
-
     let shutdown_store = state.store.clone();
-    axum::serve(listener, app(state))
-        .with_graceful_shutdown(shutdown_signal(shutdown_store))
-        .await
-        .expect("serve failed");
+    let serve_app = app(state);
+    match cfg.node.tls {
+        Some(tls) => {
+            tracing::info!("serving over TLS ({})", tls.cert_path);
+            let listener = match bunnymeshdb::server::tls::build(&cfg.node.listen, &tls).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("fatal: {e}");
+                    std::process::exit(1);
+                }
+            };
+            axum::serve(listener, serve_app)
+                .with_graceful_shutdown(shutdown_signal(shutdown_store))
+                .await
+                .expect("serve failed");
+        }
+        None => {
+            let listener = match tokio::net::TcpListener::bind(&cfg.node.listen).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("fatal: bind {}: {e}", cfg.node.listen);
+                    std::process::exit(1);
+                }
+            };
+            axum::serve(listener, serve_app)
+                .with_graceful_shutdown(shutdown_signal(shutdown_store))
+                .await
+                .expect("serve failed");
+        }
+    }
     ckpt_task.abort();
     if let Some(t) = sync_task {
         t.abort();
