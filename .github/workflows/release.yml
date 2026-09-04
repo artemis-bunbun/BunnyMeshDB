@@ -1,0 +1,52 @@
+name: release
+
+# Builds static-musl release binaries for x86_64 and aarch64 and attaches them
+# to the tag that triggered it (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+#
+# Uses `cross` (cross-rs) so both arches build with their native musl libc —
+# no glibc dependency, matching the Alpine runtime image. mimalloc is enabled
+# for musl (the Dockerfile rationale: musl's malloc collapses under worker
+# contention; mimalloc restores glibc parity).
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release
+      - name: SDK typecheck
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: cd sdk && npm install && npx tsc -p tsconfig.json
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+      - name: Build static-musl (mimalloc)
+        run: cross build --release --features mimalloc --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf bunnymeshdb-${{ matrix.target }}.tgz bunnymeshdb bunnymeshdbd
+      - name: Attach to tag
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/${{ matrix.target }}/release/bunnymeshdb-${{ matrix.target }}.tgz

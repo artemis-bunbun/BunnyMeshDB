@@ -1,0 +1,120 @@
+// Daemon-level integration test. Boots a real bunnymeshdbd on an ephemeral
+// port and exercises the HTTP surface end-to-end: guarded serve self-init,
+// health, capability auth (read-only caps can read, can't write), PUT/get,
+// JSON-Schema enforcement (400 schema_violation), and SSE push (a concurrent
+// PUT must arrive as a live event).
+//
+//   cargo build --release && node tests/integration.mjs
+//
+// Requires Node >= 18 and a built daemon (default ./target/release/bunnymeshdbd,
+// override with BMDB_BIN).
+
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { BunnyMeshClient } from "../sdk/dist/index.js";
+
+const BIN = process.env.BMDB_BIN || "./target/release/bunnymeshdbd";
+
+async function freePort() {
+  const s = createServer();
+  await new Promise((res, rej) => { s.once("error", rej); s.listen(0, "127.0.0.1", res); });
+  const port = s.address().port;
+  s.close();
+  return port;
+}
+
+const dir = mkdtempSync("/tmp/bmdb-itest-");
+const httpPort = await freePort();
+const cfgPath = `${dir}/config.toml`;
+const logPath = `${dir}/server.log`;
+writeFileSync(cfgPath, `[node]
+name = "itest.bunnymeshdb.test"
+data_dir = "${dir}/data"
+listen = "127.0.0.1:${httpPort}"
+p2p_listen = "0"
+worker_threads = 2
+mesh_sync = false
+[node.l3]
+default_quota = 1048576
+`);
+
+const proc = spawn("bash", ["-c", `exec "${BIN}" serve --config "${cfgPath}"`], {
+  cwd: process.cwd(),
+  stdio: ["ignore", "pipe", "pipe"],
+});
+let logBuf = "";
+proc.stdout.on("data", (d) => { logBuf += d; });
+proc.stderr.on("data", (d) => { logBuf += d; });
+proc.on("error", (e) => { console.error("spawn error:", e); process.exit(2); });
+
+const base = `http://127.0.0.1:${httpPort}`;
+let pass = 0;
+const ok = (name, cond, extra = "") => {
+  if (!cond) throw new Error(`FAIL: ${name} ${extra}`);
+  pass++;
+  console.log(`ok ${pass} - ${name}${extra ? ` (${extra})` : ""}`);
+};
+
+async function eventually(fn, what, timeoutMs = 12000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try { if (await fn()) return; } catch {}
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(`timed out: ${what}`);
+}
+
+await eventually(() => fetch(base + "/healthz").then((r) => r.ok), "daemon health");
+ok("guarded serve self-init + health", true);
+
+// Gather the admin capability from the daemon's own startup log (we spliced
+// stdout/stderr into logBuf).
+let adminCap = null;
+for (const step of [1, 2, 3, 4, 5]) {
+  const m = /admin cap: (bmdb-cap:[\w.-]+)/.exec(logBuf);
+  if (m) { adminCap = m[1]; break; }
+  await new Promise((r) => setTimeout(r, 500));
+}
+if (!adminCap) {
+  await new Promise((r) => setTimeout(r, 1500));
+  const m = /admin cap: (bmdb-cap:[\w.-]+)/.exec(logBuf);
+  adminCap = m && m[1];
+}
+ok("admin capability logged", !!adminCap);
+
+const client = new BunnyMeshClient(base, adminCap);
+await client.createNamespace("it", "register");
+const db = await client.openL2("it");
+
+const put = await db.put("k1", "hello-itest");
+ok("PUT returns seq", typeof put.seq === "number" && put.seq > 0);
+ok("GET roundtrip", (await db.getText("k1")) === "hello-itest");
+
+const ro = await client.openL2("it", { perms: ["read"] });
+ok("read-only cap can GET", (await ro.getText("k1")) === "hello-itest");
+let ro403 = false;
+try { await ro.put("x", "no"); } catch (e) { ro403 = e.status === 403; }
+ok("read-only cap cannot PUT (403)", ro403);
+
+await client.setSchema("it", { type: "object", properties: { title: { type: "string" } }, required: ["title"], additionalProperties: false });
+let schema400 = false;
+try { await db.put("bad", JSON.stringify({ nope: 1 })); } catch (e) { schema400 = e.status === 400 && e.error.startsWith("schema_violation"); }
+ok("schema violation -> 400 schema_violation", schema400);
+await db.put("good", JSON.stringify({ title: "ok" }));
+ok("schema-conforming PUT ok", JSON.parse(await db.getText("good")).title === "ok");
+await client.clearSchema("it");
+
+// SSE push: a concurrent PUT must surface as a live event.
+const events = [];
+let subErr = null;
+const subDone = db.subscribe((ev) => { events.push(ev); }).catch((e) => { subErr = e; });
+await new Promise((r) => setTimeout(r, 300));
+const seq2 = (await db.put("k2", "sse-push")).seq;
+await eventually(() => Promise.resolve(events.length >= 1 && events[0].seq === seq2), "SSE event", 8000);
+ok("SSE event arrives on concurrent PUT", true, `seq=${events[0].seq}`);
+
+try { proc.kill("SIGKILL"); } catch {}
+try { await subDone; } catch {}
+rmSync(dir, { recursive: true, force: true });
+console.log(`\nPASS all ${pass} integration assertions`);

@@ -913,6 +913,145 @@ impl Store {
     }
 }
 
+/// Offline log compaction + TTL GC for a standalone node.
+///
+/// Rewrites each namespace append-log to contain only the records needed to
+/// reproduce the current state: the winning LWW value (or every retained
+/// Register version) per live key, and one DEL per tombstoned key. Superseded
+/// versions and **expired TTL rows are dropped**, reclaiming disk that a
+/// TTL/churn-heavy workload would otherwise grow forever.
+///
+/// Safety: refuses on any node that has mesh-synced (`peer_clocks` non-empty).
+/// The append-log is the replication dedupe authority (records are identified
+/// by `(tag, hlc, replica)`); compacting away a record that a peer later
+/// re-sends would cause it to be re-applied locally — e.g. a compacted-away
+/// tombstone re-tombstoning a live key. Compaction in a mesh is only safe
+/// with a coordination barrier the engine does not have. Call with the
+/// daemon **stopped** (single process; no concurrent appends).
+///
+/// Returns bytes reclaimed. Sequence numbers restart at 1 for every
+/// namespace (this is a maintenance operation, not an online GC).
+pub fn compact_dir(dir: &Path) -> Result<u64, StorageError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    // Open to validate + read current state.
+    let store = Store::open(dir)?;
+    if !store.peer_clocks.is_empty() {
+        return Err(StorageError::Io(format!(
+            "refusing to compact: node has mesh-synced peers ({} peer clock(s) recorded); \
+compaction is only safe on a standalone node",
+            store.peer_clocks.len()
+        )));
+    }
+
+    fn seg_bytes(root: &Path, ns: &str) -> u64 {
+        let d = ns_dir(root, ns);
+        let mut total = 0u64;
+        let mut i = 0u32;
+        loop {
+            match std::fs::metadata(d.join(format!("log.{i}.seg"))) {
+                Ok(m) => total += m.len(),
+                Err(_) => break,
+            }
+            i += 1;
+        }
+        total
+    }
+
+    let mut reclaimed = 0u64;
+    let nss: Vec<String> = store.namespaces().iter().map(|(n, _)| n.clone()).collect();
+    for ns in nss {
+        let ns = ns.clone();
+        let before = seg_bytes(dir, &ns);
+        let mut out: Vec<Record> = Vec::new();
+        // Live values (index), skipping expired TTL rows.
+        for (k, e) in store.scan(&ns, b"") {
+            match e {
+                Entry::Lww(v) => {
+                    if v.expires_at != 0 && v.expires_at <= now {
+                        continue; // expired → drop (reads already treat it absent)
+                    }
+                    out.push(Record {
+                        tag: if v.expires_at == 0 { TAG_PUT } else { TAG_PUT_TTL },
+                        key: k.clone(),
+                        hlc: v.hlc,
+                        replica: v.replica,
+                        author: v.author,
+                        value: v.value.clone(),
+                        expires_at: v.expires_at,
+                    });
+                }
+                Entry::Register(vs) => {
+                    for v in vs {
+                        if v.expires_at != 0 && v.expires_at <= now {
+                            continue;
+                        }
+                        out.push(Record {
+                            tag: if v.expires_at == 0 { TAG_PUT } else { TAG_PUT_TTL },
+                            key: k.clone(),
+                            hlc: v.hlc,
+                            replica: v.replica,
+                            author: v.author,
+                            value: v.value.clone(),
+                            expires_at: v.expires_at,
+                        });
+                    }
+                }
+            }
+        }
+        // Tombstoned keys (deleted, not present in the index): keep one DEL.
+        for ((n, k), hlc) in store.tombs.iter() {
+            if n != &ns {
+                continue;
+            }
+            let ek = (ns.to_string(), k.clone());
+            if store.index.contains_key(&ek) {
+                continue;
+            }
+            out.push(Record {
+                tag: TAG_DEL,
+                key: k.clone(),
+                hlc: *hlc,
+                replica: [0u8; 32],
+                author: [0u8; 32],
+                value: Vec::new(),
+                expires_at: 0,
+            });
+        }
+        if out.is_empty() {
+            // Namespace has no live data: drop its log entirely.
+            let d = ns_dir(dir, &ns);
+            let mut i = 0u32;
+            loop {
+                let p = d.join(format!("log.{i}.seg"));
+                match std::fs::metadata(&p) {
+                    Ok(_) => {
+                        let _ = std::fs::remove_file(&p);
+                        i += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+        } else {
+            let d = ns_dir(dir, &ns);
+            Log::write_fresh(&d, &out)?;
+        }
+        let after = seg_bytes(dir, &ns);
+        reclaimed = reclaimed.saturating_add(before.saturating_sub(after));
+    }
+    drop(store);
+
+    // Re-open the rewritten logs to validate + rebuild a clean index, then
+    // checkpoint base-0 snapshots so the meta (caps/admin_cap) survives and
+    // the on-disk state reconciles.
+    let mut store2 = Store::open(dir)?;
+    store2.checkpoint()?;
+    Ok(reclaimed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,6 +1141,68 @@ mod tests {
                 assert_eq!(vs[1].value, b"b");
             }
             _ => panic!("expected Register"),
+        }
+    }
+
+    #[test]
+    fn compact_drops_superseded_and_expired_keeps_live_and_tombs() {
+        let dir = tmpdir("compact");
+        {
+            let mut s = Store::open(&dir).unwrap();
+            s.create_namespace("n", ConflictPolicy::Lww).unwrap();
+            seed(&mut s, "n", "k1", "fresh", 100);
+            seed(&mut s, "n", "k1", "newer", 200); // supersedes fresh under LWW
+            // expired TTL row (expires_at in the past → dropped)
+            s.put("n", &b"k2".to_vec(), b"bye", 300, REP, AUTH, 1).unwrap();
+            // live TTL row (never expires)
+            s.put("n", &b"k3".to_vec(), b"keep", 400, REP, AUTH, i64::MAX as u64).unwrap();
+            // tombstone
+            s.put("n", &b"k4".to_vec(), b"tmp", 500, REP, AUTH, 0).unwrap();
+            s.delete("n", &b"k4".to_vec(), 501, REP, AUTH).unwrap();
+            // no checkpoint — everything lives in the log
+        }
+        let reclaimed = compact_dir(&dir).unwrap();
+        // Fresh single segment (log.0.seg only, no log.1+).
+        let nd = ns_dir(&dir, "n");
+        assert!(std::fs::metadata(nd.join("log.0.seg")).is_ok());
+        assert!(std::fs::metadata(nd.join("log.1.seg")).is_err());
+        let mut s = Store::open(&dir).unwrap();
+        // Live LWW value retained (superseded "fresh" gone).
+        match s.get("n", &b"k1".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.value, b"newer"),
+            _ => panic!("expected Lww"),
+        }
+        // Expired TTL row dropped → reads as absent.
+        assert_eq!(s.get("n", &b"k2".to_vec()), None);
+        // Live TTL row retained.
+        match s.get("n", &b"k3".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.value, b"keep"),
+            _ => panic!("expected Lww"),
+        }
+        // Deleted key absent, tombstone kept as a DEL record in the fresh log.
+        assert_eq!(s.get("n", &b"k4".to_vec()), None);
+        let recs = s.log_records("n", 1).unwrap();
+        assert!(recs.iter().any(|(_, bytes)| bytes[0] == TAG_DEL));
+        // Seq restarted small (only live + tombstone records remain).
+        assert!(recs.len() < 4);
+        // Policy survived.
+        assert_eq!(s.policy("n"), Some(ConflictPolicy::Lww));
+        let _ = reclaimed;
+    }
+
+    #[test]
+    fn compact_refuses_mesh_synced_node() {
+        let dir = tmpdir("compact-mesh");
+        {
+            let mut s = Store::open(&dir).unwrap();
+            s.create_namespace("n", ConflictPolicy::Lww).unwrap();
+            seed(&mut s, "n", "k", "v", 1);
+            s.set_peer_clock("node2", 5); // marks mesh-synced
+            s.checkpoint().unwrap(); // must be durable for the guard to see it
+        }
+        match compact_dir(&dir) {
+            Ok(_) => panic!("compact must refuse a mesh-synced node"),
+            Err(e) => assert!(format!("{e}").contains("mesh-synced") || format!("{e}").contains("standalone")),
         }
     }
 

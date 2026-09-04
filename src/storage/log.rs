@@ -454,6 +454,38 @@ impl Log {
         Ok(())
     }
 
+    /// Write a brand-new `log.0.seg` from `records`, re-chaining them
+    /// (each record's `prev` is recomputed from the running head). Removes
+    /// any pre-existing segment files in `dir` first. Keeps other files in
+    /// the namespace dir (e.g. `policy.bin`) untouched. Used by offline
+    /// compaction. Fsyncs the fresh segment before returning.
+    pub fn write_fresh(dir: &Path, records: &[Record]) -> Result<(), StorageError> {
+        // Remove any old segments.
+        let mut i = 0u32;
+        loop {
+            let p = seg_path(dir, i);
+            match std::fs::metadata(&p) {
+                Ok(_) => {
+                    std::fs::remove_file(&p)?;
+                    i += 1;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        std::fs::create_dir_all(dir)?;
+        let path = seg_path(dir, 0);
+        let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(&path)?;
+        let mut head = [0u8; 32];
+        for record in records {
+            let bytes = record.to_bytes(head);
+            f.write_all(&bytes)?;
+            head = Record::record_hash(&head, &bytes);
+        }
+        f.sync_all()?;
+        Ok(())
+    }
+
     fn segment_at(&self, off: u64) -> Result<(usize, u32, u64), StorageError> {
         let mut acc = 0u64;
         for (i, (seg_no, len)) in self.seg_lens.iter().enumerate() {

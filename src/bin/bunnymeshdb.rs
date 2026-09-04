@@ -92,6 +92,12 @@ enum Commands {
         #[arg(long)]
         data_dir: PathBuf,
     },
+    /// Compact logs + GC expired TTL entries (standalone nodes only; the
+    /// daemon must be stopped). Refuses a node that has mesh-synced.
+    Compact {
+        /// Node data dir to compact.
+        data: PathBuf,
+    },
 }
 
 fn main() {
@@ -183,6 +189,17 @@ fn main() {
             }
             match copy_tree(&backup, &data_dir) {
                 Ok(()) => println!("restored {} → {}", backup.display(), data_dir.display()),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Compact { data } => {
+            match bunnymeshdb::storage::compact_dir(&data) {
+                Ok(reclaimed) => {
+                    println!("compacted {} ({} bytes reclaimed); logs restarted at seq 1", data.display(), reclaimed);
+                }
                 Err(e) => {
                     eprintln!("error: {e}");
                     std::process::exit(1);

@@ -154,6 +154,14 @@ See `sdk/README.md` for the full surface.
   `/events` (SSE), `/ql`.
 - L3 (owner-identity-gated): `u/{pk}` variants of the data routes.
 
+## Operations
+
+- `bunnymeshdb backup|restore` — checkpoint + copy (see caveat above).
+- `bunnymeshdb compact <data-dir>` — reclaim disk on a TTL/churn-heavy
+  **standalone** node: drops superseded versions and expired TTL rows from the
+  log. Run with the daemon stopped; refuses a mesh-synced node (compaction is
+  only safe single-node). Sequence numbers restart at 1.
+
 ## Documented performance
 
 See `docs/BENCHMARKS.md` for measured throughput and memory under

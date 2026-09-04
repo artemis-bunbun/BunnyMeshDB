@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (release, zero warnings check)
+        run: cargo build --release 2>&1 | tee build.log; ! grep -E 'warning|error' build.log
+      - name: Test
+        run: cargo test --release
+      - name: Compile musl (mimalloc) target
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --target x86_64-unknown-linux-musl --features mimalloc
+        if: ${{ github.event_name == 'push' }}
+
+  sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install deps
+        run: cd sdk && npm install
+      - name: Typecheck + build
+        run: cd sdk && npx tsc -p tsconfig.json
+      - name: Runtime compat check (pure-JS fallbacks, no Node globals)
+        run: cd sdk && node scripts/rn-compat-check.mjs
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: [test, sdk]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Build daemon
+        run: cargo build --release
+      - name: Build SDK
+        run: cd sdk && npm install && npx tsc -p tsconfig.json
+      - name: Boot daemon + run integration test
+        run: node tests/integration.mjs
