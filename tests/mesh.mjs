@@ -123,9 +123,15 @@ await eventually(
 );
 ok("mesh: index def + by_index converge on B", true);
 
-// peer pins were recorded (TOFU) — the sync actually happened over libp2p
-const bLog = b.log();
-ok("mesh: B dialed + pulled from A", /sending pull.*ns=shared/.test(bLog) || /hello processed peer=mesh-a/.test(bLog));
+// peer pins were recorded (TOFU) — the sync actually happened over libp2p.
+// Poll the log buffer: the HTTP convergence above races subprocess pipe I/O,
+// so a point-in-time read can sample between flushes. `eventually` makes the
+// log-text check deterministic (same pattern as the other async assertions).
+await eventually(() => {
+  const bLog = b.log();
+  return /sending pull.*ns=shared/.test(bLog) || /hello processed peer=mesh-a/.test(bLog);
+}, "B dialed + pulled from A (log)", 20000);
+ok("mesh: B dialed + pulled from A", true);
 
 a.proc.kill("SIGKILL"); b.proc.kill("SIGKILL");
 await new Promise((r) => setTimeout(r, 50));
