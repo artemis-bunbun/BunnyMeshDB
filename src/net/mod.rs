@@ -677,13 +677,4 @@ impl Runner {
 }
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn dbg_peer_id() {
-        let pk: crate::core::ident::PublicKey =
-            std::fs::read_to_string("/tmp/meshA/pk").unwrap().trim().parse().unwrap();
-        let ed = libp2p::identity::ed25519::PublicKey::try_from_bytes(&pk.to_bytes()).unwrap();
-        let pubk = libp2p::identity::PublicKey::from(ed);
-        let pid = libp2p::PeerId::from_public_key(&pubk);
-        eprintln!("computed: {pid}");
-    }
 }
