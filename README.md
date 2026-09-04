@@ -148,13 +148,23 @@ See `sdk/README.md` for the full surface.
 ## HTTP API
 
 - `GET /healthz`
-- Admin (L1, `admin` perm): namespaces, capability issue/revoke, JSON-Schema.
+- Admin (L1, `admin` perm): namespaces, capability issue/revoke, JSON-Schema,
+  secondary indexes (`GET|POST|DELETE /l1/namespaces/{ns}/index`).
 - Data (L2 cap-authenticated): `GET/PUT/DELETE /l2/{ns}/{key}?ttl=&versions=`,
   `GET /l2/{ns}?prefix=`, `/head`, `/changes?since=`, `/conflicts`,
   `/events?since=` (SSE push, auto-resumes from the last seen seq),
   `/ql`.
 - L3 (owner-identity-gated): `u/{pk}` variants of the data routes.
 - `GET /metrics` (open): runtime counters — requests, writes, namespaces.
+
+**Secondary indexes / query.** Values are JSON. Define indexed fields per
+namespace (`POST /l1/namespaces/{ns}/index` with `["field", ...]`), then in
+`/ql` query them: `by_index("city", "london")` returns keys whose value's
+`city` field equals `"london"`, in sorted order. The index definition
+replicates through the mesh; the index itself is derived from values on every
+peer, so `by_index` answers identically everywhere. `/ql` also has
+`get/put/del/scan/get_all`, `index_create/index_fields/index_drop`,
+`use/create_ns`, `now/hlc/before/clock_skew`.
 
 ## Operations
 

@@ -171,8 +171,6 @@ fn exec(ctx: &mut QueryCtx, call: &Call) -> Result<Value, QueryError> {
             let ns = scope(ctx)?;
             let key = str_arg(ctx, &call.args[0])?.into_bytes();
             match ctx.store.get(&ns, &key) {
-                // Tombstoned → empty view.
-                None => Ok(Value::Null),
                 Some(Entry::Lww(v)) => Ok(Value::List(vec![
                     Value::Str(hex::encode(v.replica)),
                     Value::Num(v.hlc),
@@ -187,7 +185,73 @@ fn exec(ctx: &mut QueryCtx, call: &Call) -> Result<Value, QueryError> {
                     }
                     Ok(Value::List(out))
                 }
+                None => Ok(Value::Null),
             }
+        }
+        "index_create" => {
+            // index_create(field[, field...]) — define a primary secondary
+            // index on scalar JSON fields of the current scope's namespace.
+            // Requires a write-scope caller. The definition replicates; the
+            // index itself is derived from values on every peer.
+            if call.args.is_empty() {
+                return Err(QueryError::Type("index_create(field[, field...])".to_string()));
+            }
+            let ns = scope(ctx)?;
+            let mut fields: Vec<String> = Vec::with_capacity(call.args.len());
+            for a in &call.args {
+                fields.push(str_arg(ctx, a)?);
+            }
+            let hlc = Hlc::now().to_u64();
+            let rid = ctx.host_id.to_bytes();
+            let value = serde_json::to_vec(&fields).expect("index fields");
+            ctx.store.set_index(&ns, Some(&value), hlc, rid, rid)?;
+            Ok(Value::Bool(true))
+        }
+        "index_fields" => {
+            // index_fields(ns?) — list the namespace's indexed fields.
+            let ns = scope(ctx)?;
+            let fields = match ctx.store.index_def(&ns) {
+                Some(b) => {
+                    let s = String::from_utf8_lossy(b).into_owned();
+                    match serde_json::from_str::<Vec<String>>(&s) {
+                        Ok(fs) => fs,
+                        Err(_) => Vec::new(),
+                    }
+                }
+                None => Vec::new(),
+            };
+            Ok(Value::List(fields.iter().map(|f| Value::Str(f.clone())).collect::<Vec<_>>()))
+        }
+        "index_drop" => {
+            // index_drop(ns?) — clear the secondary index definition.
+            let ns = scope(ctx)?;
+            let hlc = Hlc::now().to_u64();
+            let rid = ctx.host_id.to_bytes();
+            ctx.store.set_index(&ns, None, hlc, rid, rid)?;
+            Ok(Value::Bool(true))
+        }
+        "by_index" => {
+            // by_index(field, value, ns?) — rows where the indexed FIELD's
+            // value equals VALUE, resolved via the secondary index. Field
+            // values are scalar JSON extractions (string/number/bool) from
+            // each stored value; a value with no such field simply isn't
+            // indexed. Returns [key, ...] for matching sorted rows.
+            if call.args.len() < 2 || call.args.len() > 3 {
+                return Err(QueryError::Type("by_index(field, value[, ns])".to_string()));
+            }
+            let ns = scope(ctx)?;
+            let field = str_arg(ctx, &call.args[0])?;
+            let want = str_arg(ctx, &call.args[1])?.into_bytes();
+            let rows = ctx.store.index_lookup(&ns, &field, &want);
+            // index_lookup returns (fieldvalue, key) >= want; keep exact runs.
+            let mut out = Vec::with_capacity(rows.len());
+            for (fv, k) in rows {
+                if fv != want {
+                    break; // sorted; once past the match, nothing more matches
+                }
+                out.push(Value::Str(String::from_utf8_lossy(&k).into_owned()));
+            }
+            Ok(Value::List(out))
         }
         other => Err(QueryError::UnknownFn(other.to_string())),
     }
@@ -526,5 +590,62 @@ mod tests {
         assert_eq!(eval(&mut c, "get(\"a\")").unwrap().json(), "\"1\"");
         let rows = eval(&mut c, "scan(\"b\")").unwrap();
         assert_eq!(rows, Value::List(vec![Value::Str("b/c".into()), Value::Str("2".into())]));
+    }
+
+    #[test]
+    fn secondary_index_derived_and_queried() {
+        let dir = tmpdir("secidx");
+        {
+            let mut s = Store::open(&dir).unwrap();
+            let mut c = ctx(&mut s);
+            eval(&mut c, "create_ns(\"people\")").unwrap();
+            eval(&mut c, "use(\"people\")").unwrap();
+            // JSON values with an indexed "city" field (values are JSON-encoded
+            // strings in the DSL; the index extracts the field from them).
+            eval(&mut c, "put(\"ada\", \"{\\\"city\\\":\\\"london\\\"}\")").unwrap();
+            eval(&mut c, "put(\"bob\", \"{\\\"city\\\":\\\"paris\\\"}\")").unwrap();
+            eval(&mut c, "put(\"cyn\", \"{\\\"city\\\":\\\"london\\\"}\")").unwrap();
+            // Define the secondary index on city.
+            assert_eq!(eval(&mut c, "index_create(\"city\")").unwrap().json(), "true");
+            // by_index(city, london) → ada, cyn (sorted by key).
+            let rows = eval(&mut c, "by_index(\"city\",\"london\")").unwrap();
+            assert_eq!(
+                rows,
+                Value::List(vec![Value::Str("ada".into()), Value::Str("cyn".into())])
+            );
+            // Different value.
+            let rows2 = eval(&mut c, "by_index(\"city\",\"paris\")").unwrap();
+            assert_eq!(rows2, Value::List(vec![Value::Str("bob".into())]));
+            // Overwrite bob → rebuilds his row.
+            eval(&mut c, "put(\"bob\", \"{\\\"city\\\":\\\"london\\\"}\")").unwrap();
+            let rows3 = eval(&mut c, "by_index(\"city\",\"london\")").unwrap();
+            assert_eq!(
+                rows3,
+                Value::List(vec![Value::Str("ada".into()), Value::Str("bob".into()), Value::Str("cyn".into())])
+            );
+            // Delete removes index rows.
+            eval(&mut c, "del(\"ada\")").unwrap();
+            let rows4 = eval(&mut c, "by_index(\"city\",\"london\")").unwrap();
+            assert_eq!(
+                rows4,
+                Value::List(vec![Value::Str("bob".into()), Value::Str("cyn".into())])
+            );
+        }
+        // Reopen: the index is rebuilt from the definition + current values
+        // (definition replicated, index derived) and still answers.
+        {
+            let mut s = Store::open(&dir).unwrap();
+            let mut c = ctx(&mut s);
+            eval(&mut c, "use(\"people\")").unwrap();
+            assert_eq!(
+                eval(&mut c, "index_fields()").unwrap().json(),
+                "[\"city\"]"
+            );
+            let rows = eval(&mut c, "by_index(\"city\",\"london\")").unwrap();
+            assert_eq!(
+                rows,
+                Value::List(vec![Value::Str("bob".into()), Value::Str("cyn".into())])
+            );
+        }
     }
 }

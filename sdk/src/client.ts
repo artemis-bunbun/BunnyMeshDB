@@ -133,6 +133,40 @@ export class BunnyMeshClient {
     );
   }
 
+  /** Set a per-namespace index field list (replicated to every mesh peer,
+   * which derive the same secondary index from the same values). `fields` is
+   * the array of scalar JSON field names to index. */
+  async setIndex(ns: string, fields: string[]): Promise<void> {
+    await request(
+      this.baseUrl,
+      { method: "POST", path: `/l1/namespaces/${encodeURIComponent(ns)}/index`, auth: this.admin, json: fields },
+      async () => undefined,
+    );
+  }
+
+  /** Clear the namespace's secondary index definition. */
+  async clearIndex(ns: string): Promise<void> {
+    await request(
+      this.baseUrl,
+      { method: "DELETE", path: `/l1/namespaces/${encodeURIComponent(ns)}/index`, auth: this.admin },
+      async () => undefined,
+    );
+  }
+
+  /** The active index-field list, or `null` if none is set. */
+  async getIndex(ns: string): Promise<string[] | null> {
+    try {
+      return await request(
+        this.baseUrl,
+        { method: "GET", path: `/l1/namespaces/${encodeURIComponent(ns)}/index`, auth: this.admin },
+        (res) => res.text().then(parseJson) as Promise<string[] | null>,
+      );
+    } catch (e) {
+      if (e instanceof BunnyMeshError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
   /** The active namespace schema, or `null` if none is set. */
   async getSchema(ns: string): Promise<unknown> {
     try {

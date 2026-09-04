@@ -134,6 +134,18 @@ ok("peer list contains added", peers.some((p) => p.name === "peer-x.test"));
 const delRes = await fetch(base + "/l1/peers/peer-x.test", { method: "DELETE", headers: H });
 ok("peer remove ok", delRes.ok);
 
+// secondary indexes: admin sets a field list; json values index + query.
+const idxSet = await fetch(base + "/l1/namespaces/it/index", { method: "POST", headers: H, body: JSON.stringify(["city"]) });
+ok("index set admin ok", idxSet.ok, String(idxSet.status));
+const idxGet = await fetch(base + "/l1/namespaces/it/index", { headers: H });
+ok("index get returns fields", JSON.stringify((await idxGet.json())) === `["city"]`);
+await db.put("p1", JSON.stringify({ city: "london" }));
+await db.put("p2", JSON.stringify({ city: "paris" }));
+const qlLon = await db.ql(`by_index("city","london")`);
+ok("by_index london -> p1", JSON.stringify(qlLon) === `["p1"]`);
+const qlPar = await db.ql(`by_index("city","paris")`);
+ok("by_index paris -> p2", JSON.stringify(qlPar) === `["p2"]`);
+
 try { proc.kill("SIGKILL"); } catch {}
 // The SIGKILL below tears down the open SSE subscriptions; the reconnect
 // loop may reject with a transport error. Swallow + short-circuit so the

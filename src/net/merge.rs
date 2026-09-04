@@ -13,7 +13,7 @@
 //! Applying is `Store::apply_synced`: LWW keeps max (hlc, replica),
 //! Register keeps all versions, tombstones win over any version.
 
-use crate::storage::log::{Record, TAG_DEL, TAG_PUT};
+use crate::storage::log::{Record, TAG_DEL, TAG_INDEX, TAG_PUT, TAG_PUT_TTL, TAG_SCHEMA};
 
 #[derive(Debug)]
 pub enum MergeError {
@@ -50,8 +50,11 @@ pub fn verify_batch(
         let (record, prev) = Record::parse_chain(bytes, prev_hash.as_ref())
             .map_err(|e| MergeError::Corrupt(format!("record {seq}: {e}")))?;
         // Tag validity is enforced by parse; double-check semantics here.
-        if record.tag != TAG_PUT && record.tag != TAG_DEL {
-            return Err(MergeError::Corrupt(format!("record {seq}: bad tag {:#x}", record.tag)));
+        match record.tag {
+            TAG_PUT | TAG_PUT_TTL | TAG_DEL | TAG_SCHEMA | TAG_INDEX => {}
+            other => {
+                return Err(MergeError::Corrupt(format!("record {seq}: bad tag {:#x}", other)));
+            }
         }
         prev_hash = Some(Record::record_hash(&prev, bytes));
         out.push(record);

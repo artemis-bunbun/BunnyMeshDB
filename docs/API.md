@@ -36,6 +36,13 @@ JSON-Schema per namespace. GET → the schema (404 `no_schema`). POST → set
 (body is the JSON-Schema; 400 `unsupported_schema` for pattern/format/$ref).
 DELETE → clear.
 
+### `GET|POST|DELETE /l1/namespaces/{ns}/index`
+Secondary-index field list per namespace. GET → the active `["field",...]`
+(404 `no_index`). POST → set (body is the JSON array of field names; `[]`
+clears; 400 `bad_index_def`). DELETE → clear. The definition is replicated
+through the log, so every mesh peer derives the same index from the same
+values (the index itself is derived, never stored).
+
 ### `GET /l1/caps`
 The capability ledger.
 
@@ -95,7 +102,15 @@ seq back as `since`.
 `{ "conflicts": [ { "key", "count", "versions" } ] }`.
 
 ### `POST /{tier}/{ns}/ql`
-Query-DSL expression. `{ "expr" }`.
+Query-DSL expression. `{ "expr" }`. Functions:
+- `use(ns)`, `create_ns(ns)`, `now()`, `hlc()`, `before(a,b)`, `clock_skew(host)`
+- `get(key)`, `put(key, value)` (`value` must be a JSON-encoded string; the
+  DSL is string-typed), `del(key)`, `scan(prefix)`, `get_all(key)`
+- Secondary indexes: `index_create("field", ...)`, `index_fields()`,
+  `index_drop()`, and the indexed read `by_index("field", "value")` → keys
+  whose value's `field` equals `value`, sorted. Define the index with the
+  admin `/index` route (or `index_create`); values are JSON and the scalar
+  field is extracted per value. Fields are only answerable once indexed.
 
 ## Rate limiting
 

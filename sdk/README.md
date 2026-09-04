@@ -59,6 +59,9 @@ for (const c of changes) console.log(c.seq, c.key, c.del ? "del" : "put");
 | `setSchema(ns, schema)` | set per-namespace JSON-Schema (replicated) |
 | `getSchema(ns)` | active schema, or `null` when none is set |
 | `clearSchema(ns)` | clear the schema (validation off) |
+| `setIndex(ns, fields)` | index scalar JSON fields (replicated); enables `by_index` |
+| `getIndex(ns)` | active index-field list, or `null` when none is set |
+| `clearIndex(ns)` | clear the secondary-index definition |
 | `openL2(ns, opts?)` | issue an L2 cap (default `["read","write"]`) + return `DataClient`; `{ perms: ["read"] }` for a read-only client |
 | `data(ns, capOrToken)` | `DataClient` from an existing capability |
 | `l3(pk)` | `DataClient` for owner namespace `u/<pk>` (identity-gated) |
@@ -75,7 +78,7 @@ for (const c of changes) console.log(c.seq, c.key, c.del ? "del" : "put");
 | `changes(since?)` | gapless `{since, head, changes[]}` stream |
 | `subscribe(onEvent, signal?)` | live SSE push — one event per write, carrying the log head |
 | `conflicts()` | register-policy keys with >1 divergent version |
-| `ql(expr)` | query-DSL expression |
+| `ql(expr)` | query-DSL expression (`by_index("field","value")` for indexed reads) |
 
 Errors: failed HTTP → `BunnyMeshError` (`status` + machine-readable `error`).
 `get`/`head` return `null` on 404; everything else throws.

@@ -74,6 +74,16 @@ Full history: see git log. Repo: `github.com/artemis-bunbun/BunnyMeshDB`.
 
 ## unreleased
 
+- **Secondary indexes + indexed queries**: define indexed fields per namespace
+  (`/l1/namespaces/{ns}/index`, or `index_create` in `/ql`); the engine
+  derives an in-memory secondary index from JSON-stored values and answers
+  `by_index("field", "value")` in sorted order. The definition replicates
+  through the mesh (an `index@`-style `TAG_INDEX` log record, mirroring
+  JSON-Schema), and the index itself is derived from values on every peer —
+  so `by_index` converges across nodes without racing (values converge →
+  derived indexes converge). Index maintenance rides the put/delete/synced
+  apply paths and rebuilds on open. 1 new unit test (65 total) + 4 integration
+  assertions (18/18).
 - **Root key rotation** (`bunnymeshdb rotate-key <data-dir>`): swap the active
   ed25519 keypair without bricking the deployment. Graceful mode keeps the
   previous key valid (a `RootKeyring` on the verification path accepts current
@@ -83,4 +93,4 @@ Full history: see git log. Repo: `github.com/artemis-bunbun/BunnyMeshDB`.
   and must be re-issued; `--reissue-admin` re-signs the persisted admin cap so
   the operator isn't locked out. Persists retired keys in `sys/root_chain`;
   chain is written before meta.bin so a crash is re-runnable. Offline op
-  (daemon stopped). 2 new tests (64 total).
+  (daemon stopped).

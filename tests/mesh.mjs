@@ -110,6 +110,19 @@ await dbB.put("reverse", "from-b");
 await eventually(() => dbA.getText("reverse").then((v) => v === "from-b"), "A converges on B's write", 30000);
 ok("mesh: A converges on B's write", true);
 
+// secondary index definition + derived index converge through the mesh
+const adminA = ca; // has admin cap
+await adminA.setIndex("shared", ["city"]).catch(() => {});
+// write JSON-valued rows on A after indexing so B derives them from the pull
+await dbA.put("p1", JSON.stringify({ city: "london" }));
+await dbA.put("p2", JSON.stringify({ city: "paris" }));
+await eventually(
+  () => dbB.ql(`by_index("city","london")`).then((v) => JSON.stringify(v) === `["p1"]`),
+  `B by_index converges on A's indexed rows`,
+  30000,
+);
+ok("mesh: index def + by_index converge on B", true);
+
 // peer pins were recorded (TOFU) — the sync actually happened over libp2p
 const bLog = b.log();
 ok("mesh: B dialed + pulled from A", /sending pull.*ns=shared/.test(bLog) || /hello processed peer=mesh-a/.test(bLog));

@@ -7,15 +7,35 @@
 
 pub mod log;
 
-use crate::storage::log::{Log, RecoverWarning, Record, TAG_DEL, TAG_PUT, TAG_PUT_TTL, TAG_SCHEMA};
-use std::collections::BTreeMap;
+use crate::storage::log::{Log, RecoverWarning, Record, TAG_DEL, TAG_INDEX, TAG_PUT, TAG_PUT_TTL, TAG_SCHEMA};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::ops::Bound::{Included, Unbounded};
 use std::path::{Path, PathBuf};
+use serde_json::Value as JValue;
 
 pub type Namespace = String;
 pub type Key = Vec<u8>;
+
+/// The visible (latest) version of an entry: for LWW the single stored
+/// version; for Register the max by (hlc, replica) — the same across peers.
+fn latest_entry_value(e: &Entry) -> Option<&Version> {
+    match e {
+        Entry::Lww(v) => Some(v),
+        Entry::Register(vs) => vs.iter().max_by(|a, b| (a.hlc, a.replica).cmp(&(b.hlc, b.replica))),
+    }
+}
+
+/// Composite key into `sec_index`: `ns` + NUL + `field`. Built from bytes so
+/// no string-escape concerns; NUL cannot appear in a namespace/field name.
+fn sec_map_key(ns: &str, field: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(ns.len() + field.len() + 1);
+    k.extend_from_slice(ns.as_bytes());
+    k.push(0u8);
+    k.extend_from_slice(field.as_bytes());
+    k
+}
 
 #[derive(Debug)]
 pub enum StorageError {
@@ -264,6 +284,12 @@ pub struct Store {
     revision: u64,
     /// When true, every log append is fsynced (durable writes). Config-driven.
     durable: bool,
+    /// Derived secondary index: `"<ns>\u0000<field>"` → sorted (field-value,
+    /// key) pairs. Rebuilt from the primary index + tombstones on open/replay
+    /// and maintained incrementally on put/delete. Never persisted — it is
+    /// purely a function of current state, so it always converges across mesh
+    /// peers as values converge.
+    sec_index: HashMap<Vec<u8>, BTreeSet<(Vec<u8>, Vec<u8>)>>,
 }
 
 impl Store {
@@ -291,6 +317,7 @@ impl Store {
             peer_clocks: BTreeMap::new(),
             revision: 0,
             durable,
+            sec_index: HashMap::new(),
         };
         // (ns → (seq, hash)) as of the snapshot.
         let mut snap_info: BTreeMap<Namespace, (u64, [u8; 32])> = BTreeMap::new();
@@ -386,6 +413,10 @@ impl Store {
                 .meta
                 .insert("created_ms".into(), ms.to_le_bytes().to_vec());
         }
+        // Secondary indexes are derived from current state, so a full rebuild
+        // after opening in-memory state always matches what incremental
+        // updates would have produced.
+        store.rebuild_secondary_indexes()?;
         Ok(store)
     }
 
@@ -562,6 +593,7 @@ impl Store {
                 }
             },
         }
+        self.refresh_sec_index_for(ns, key);
         self.revision += 1;
         Ok(seq)
     }
@@ -597,8 +629,237 @@ impl Store {
         let entry_key = (ns.to_string(), key.clone());
         self.index.remove(&entry_key);
         self.tombs.insert(entry_key, hlc);
+        self.remove_from_sec_index(ns, key);
         self.revision += 1;
         Ok(seq)
+    }
+
+    // ---------- secondary indexes (derived) ----------
+
+    /// The namespace's active index-field list (raw JSON bytes), if set.
+    pub fn index_def(&self, ns: &str) -> Option<&[u8]> {
+        let key = format!("index/{ns}");
+        self.meta.get(&key).map(|v| v.as_slice())
+    }
+
+    /// The parsed field names to index for `ns` (empty = no secondary index).
+    pub fn index_fields(&self, ns: &str) -> Vec<String> {
+        let Some(bytes) = self.index_def(ns) else {
+            return Vec::with_capacity(0);
+        };
+        let s = String::from_utf8_lossy(bytes).into_owned();
+        match serde_json::from_str::<Vec<String>>(&s) {
+            Ok(fs) => fs,
+            Err(_) => Vec::with_capacity(0),
+        }
+    }
+
+    /// Set (Some JSON `["field",...]`) or clear (None) a namespace's secondary
+    /// index definition. Appends a replicated TAG_INDEX record (so mesh peers
+    /// derive the same index from the same values), then refreshes the derived
+    /// index. Returns the record seq.
+    pub fn set_index(
+        &mut self,
+        ns: &str,
+        value: Option<&[u8]>,
+        hlc: u64,
+        replica: [u8; 32],
+        author: [u8; 32],
+    ) -> Result<u64, StorageError> {
+        if !self.policies.contains_key(ns) {
+            return Err(StorageError::BadName(ns.to_string()));
+        }
+        let log = self
+            .logs
+            .get_mut(ns)
+            .ok_or(StorageError::NotFound(ns.to_string()))?;
+        let record = Record {
+            tag: TAG_INDEX,
+            key: Vec::new(),
+            hlc,
+            replica,
+            author,
+            value: value.map(|v| v.to_vec()).unwrap_or_default(),
+            expires_at: 0,
+        };
+        let bytes = record.to_bytes(log.head());
+        let seq = log.append(&bytes)?;
+        let meta_key = format!("index/{ns}");
+        if let Some(v) = value.as_deref() {
+            self.meta.insert(meta_key, v.to_vec());
+        } else {
+            self.meta.remove(&meta_key);
+        }
+        self.rebuild_sec_index_ns(ns)?;
+        self.revision += 1;
+        Ok(seq)
+    }
+
+    /// Extract the scalar value (or values) of `field` from a record value.
+    /// A field points at: a JSON string/object member; a bare string value;
+    /// and — for value arrays — each element's member. Non-JSON values index
+    /// no fields (treating the whole value as `$value` is out of scope).
+    /// Returns an empty vec when the field isn't present.
+    fn field_values(value: &[u8], field: &str) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(1);
+        let s = String::from_utf8_lossy(value).into_owned();
+        match serde_json::from_str::<JValue>(&s) {
+            Ok(JValue::Object(map)) => {
+                for (k, v) in map.iter() {
+                    if k == field {
+                        Self::push_scalar(&mut out, v);
+                    }
+                }
+            }
+            Ok(v) => Self::push_scalar(&mut out, &v),
+            Err(_) => {}
+        }
+        out
+    }
+
+    fn push_scalar(out: &mut Vec<Vec<u8>>, v: &JValue) {
+        match v {
+            JValue::Number(n) => out.push(n.to_string().into_bytes()),
+            JValue::String(s) => out.push(s.clone().into_bytes()),
+            JValue::Bool(b) => out.push(if *b { b"true".to_vec() } else { b"false".to_vec() }),
+            _ => {}
+        }
+    }
+
+    /// Get-or-create the row set for `sec_map_key`. Static type is a fresh
+    /// borrow into the map — callers keep it for only one insert.
+    fn ensure_sec_set(&mut self, map_key: &Vec<u8>) -> &mut BTreeSet<(Vec<u8>, Vec<u8>)> {
+        if self.sec_index.get(map_key).is_none() {
+            self.sec_index.insert(map_key.clone(), BTreeSet::new());
+        }
+        self.sec_index.get_mut(map_key).unwrap()
+    }
+
+    /// Re-derive the secondary-index rows for one current key (the live
+    /// primary index entry is authoritative). Removes any stale rows for the
+    /// key, then, if the key is live and the namespace has fields configured,
+    /// inserts a row per (field → value) pair.
+    fn refresh_sec_index_for(&mut self, ns: &str, key: &Key) {
+        self.remove_from_sec_index(ns, key);
+        let fields = self.index_fields(ns);
+        if fields.is_empty() {
+            return;
+        }
+        // Snapshot the visible value (owned) before mutating, so the loop
+        // below can be safely interrupted by map borrows.
+        let value: Option<Vec<u8>> = match self.get(ns, key).as_deref() {
+            Some(e) => match latest_entry_value(e).as_deref() {
+                Some(v) => Some(v.value.clone()),
+                None => None,
+            },
+            None => None,
+        };
+        match value {
+            None => {}
+            Some(value) => {
+                for field in fields {
+                    for fv in Self::field_values(&value, &field).iter() {
+                        let map_key = sec_map_key(ns, &field);
+                        let set = self.ensure_sec_set(&map_key);
+                        set.insert((fv.clone(), key.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    fn remove_from_sec_index(&mut self, ns: &str, key: &Key) {
+        let fields = self.index_fields(ns);
+        for field in fields {
+            let map_key = sec_map_key(ns, &field);
+            match self.sec_index.get_mut(&map_key) {
+                Some(set) => {
+                    // Collect matching field-values first, then remove by
+                    // value so we never borrow `set` while mutating it.
+                    let doomed: Vec<Vec<u8>> = set
+                        .iter()
+                        .filter(|(_, k)| *k == *key)
+                        .map(|(fv, _)| fv.clone())
+                        .collect::<Vec<_>>();
+                    for fv in doomed {
+                        let _ = set.remove(&(fv.clone(), key.clone()));
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn clear_sec_index_ns(&mut self, ns: &str) {
+        let mut keep: Vec<Vec<u8>> = Vec::with_capacity(0);
+        let mut prefix = Vec::with_capacity(ns.len() + 1);
+        prefix.extend_from_slice(ns.as_bytes());
+        prefix.push(0u8);
+        for k in self.sec_index.keys() {
+            if k.starts_with(&prefix) {
+                keep.push(k.clone());
+            }
+        }
+        let mut next = HashMap::new();
+        for k in keep {
+            if let Some(v) = self.sec_index.remove(&k) {
+                next.insert(k, v);
+            }
+        }
+        self.sec_index = next;
+    }
+
+    fn rebuild_sec_index_ns(&mut self, ns: &str) -> Result<(), StorageError> {
+        self.clear_sec_index_ns(ns);
+        let fields = self.index_fields(ns);
+        if fields.is_empty() {
+            return Ok(());
+        }
+        // Index every live key in this namespace.
+        let mut keys: Vec<Key> = Vec::with_capacity(0);
+        for ((n, k), e) in self.index.iter() {
+            if *n == ns && latest_entry_value(e).is_some() {
+                keys.push(k.clone());
+            }
+        }
+        keys.sort();
+        for k in keys {
+            self.refresh_sec_index_for(ns, &k);
+        }
+        Ok(())
+    }
+
+    fn rebuild_secondary_indexes(&mut self) -> Result<(), StorageError> {
+        self.sec_index.clear();
+        let mut nss: Vec<Namespace> = Vec::with_capacity(0);
+        for ns in self.policies.keys() {
+            nss.push(ns.clone());
+        }
+        for ns in nss {
+            if self.index_fields(&ns).is_empty() {
+                continue;
+            }
+            self.rebuild_sec_index_ns(&ns)?;
+        }
+        Ok(())
+    }
+
+    /// Look up indexed rows for a field+value: an iterator over
+    /// `(fieldvalue, key)` rows whose `fieldvalue >= start` (byte order).
+    /// Keys come back deduped and (because rows are sorted) in primary-key
+    /// order — the building block for `WHERE field = v` / range scans.
+    pub fn index_lookup(&self, ns: &str, field: &str, start: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let map_key = sec_map_key(ns, &field);
+        match self.sec_index.get(&map_key) {
+            Some(set) => {
+                let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(0);
+                for (fv, k) in set.range((Included((start.to_vec(), Vec::new())), Unbounded)) {
+                    out.push((fv.clone(), k.clone()));
+                }
+                out
+            }
+            None => Vec::with_capacity(0),
+        }
     }
 
     pub fn get(&self, ns: &str, key: &Key) -> Option<&Entry> {
@@ -755,10 +1016,15 @@ impl Store {
                         }
                     },
                 }
+                // Synced/replayed writes must also feed the derived indexes so
+                // by_index answers identically on every peer. Reads live state
+                // (the entry we just updated), so LWW staleness is handled.
+                self.refresh_sec_index_for(ns, &record.key);
             }
             TAG_DEL => {
                 self.index.remove(&entry_key);
                 self.tombs.insert(entry_key, record.hlc);
+                self.remove_from_sec_index(ns, &record.key);
             }
             TAG_SCHEMA => {
                 // Namespace schema (metadata, not a user key). Empty value =
@@ -771,6 +1037,20 @@ impl Store {
                 } else {
                     self.meta.insert(meta_key, record.value.clone());
                 }
+            }
+            TAG_INDEX => {
+                // Namespace secondary-index definition (metadata, not a user
+                // key). Empty value = clear the definition. Replicated so
+                // every peer derives the same index from the same values.
+                let meta_key = format!("index/{ns}");
+                if record.value.is_empty() {
+                    self.meta.remove(&meta_key);
+                } else {
+                    self.meta.insert(meta_key, record.value.clone());
+                }
+                // Definitions also change which fields are queriable, so
+                // refresh the derived index for this namespace.
+                self.rebuild_sec_index_ns(ns)?;
             }
             other => {
                 return Err(StorageError::Corrupt {

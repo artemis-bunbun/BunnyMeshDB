@@ -557,6 +557,107 @@ async fn l1_schema_clear(
     }
 }
 
+// ---------- secondary indexes per namespace (admin) ----------
+
+/// GET /l1/namespaces/{ns}/index — the active index-field list, or 404 unset.
+async fn l1_index_get(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+) -> Response {
+    match auth_l1_l2(&state, caps.as_ref(), &l1_scope(&state), PermSet::ADMIN, now_ms()) {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let store = state.store.read();
+    match store.index_def(&ns) {
+        Some(bytes) => {
+            let s = String::from_utf8_lossy(bytes).into_owned();
+            let v = serde_json::from_str::<JValue>(&s).unwrap_or(JValue::Null);
+            Json(v).into_response()
+        }
+        None => err_json(StatusCode::NOT_FOUND, "no_index"),
+    }
+}
+
+/// POST /l1/namespaces/{ns}/index — set the index-field list (body: JSON
+/// array of field names). Clears when given `[]`. 400 on non-array/malformed.
+async fn l1_index_set(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    match auth_l1_l2(&state, caps.as_ref(), &l1_scope(&state), PermSet::ADMIN, now_ms()) {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let s = String::from_utf8_lossy(&body).into_owned();
+    let fields = match serde_json::from_str::<Vec<String>>(&s) {
+        Ok(fs) => fs,
+        Err(_) => return err_json(StatusCode::BAD_REQUEST, "bad_index_def"),
+    };
+    // Dedupe + reject empty names.
+    let mut seen = Vec::with_capacity(fields.len());
+    for f in fields {
+        if f.is_empty() || seen.contains(&f) {
+            continue;
+        }
+        seen.push(f);
+    }
+    let mut store = state.store.write();
+    if store.policy(&ns).is_none() {
+        return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
+    }
+    let hlc = Hlc::now().to_u64();
+    let rid = state.root.to_bytes();
+    let value = serde_json::to_vec(&seen).expect("index fields");
+    match store.set_index(&ns, Some(&value), hlc, rid, rid) {
+        Ok(seq) => {
+            drop(store);
+            state.notify_sync();
+            state.metrics.bump_writes();
+            state.notify_change(&ns);
+            Json(json!({ "ok": true, "seq": seq, "fields": seen })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(%e, "set index");
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
+/// DELETE /l1/namespaces/{ns}/index — clear the index definition.
+async fn l1_index_clear(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+) -> Response {
+    match auth_l1_l2(&state, caps.as_ref(), &l1_scope(&state), PermSet::ADMIN, now_ms()) {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let mut store = state.store.write();
+    if store.policy(&ns).is_none() {
+        return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
+    }
+    let hlc = Hlc::now().to_u64();
+    let rid = state.root.to_bytes();
+    match store.set_index(&ns, None, hlc, rid, rid) {
+        Ok(seq) => {
+            drop(store);
+            state.notify_sync();
+            state.metrics.bump_writes();
+            state.notify_change(&ns);
+            Json(json!({ "ok": true, "seq": seq })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(%e, "clear index");
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
 async fn l1_issue_cap(
     State(state): State<AppState>,
     Extension(caps): Extension<Option<AuthCaps>>,
@@ -1186,6 +1287,7 @@ pub fn app(state: AppState) -> Router {
     let protected = Router::new()
         .route("/l1/namespaces", get(l1_list_namespaces).post(l1_create_namespace))
         .route("/l1/namespaces/{ns}/schema", get(l1_schema_get).post(l1_schema_set).delete(l1_schema_clear))
+        .route("/l1/namespaces/{ns}/index", get(l1_index_get).post(l1_index_set).delete(l1_index_clear))
         .route("/l1/caps", get(l1_list_caps).post(l1_issue_cap))
         .route("/l1/peers", get(l1_peers_list).post(l1_peers_add))
         .route("/l1/peers/{name}", delete(l1_peers_remove))

@@ -37,6 +37,12 @@ pub const TAG_PUT_TTL: u8 = 0x03;
 /// Namespace-scoped metadata, not a user key: same wire layout as TAG_PUT
 /// (key is empty), never surfaced in scans/changes/change-feed.
 pub const TAG_SCHEMA: u8 = 0x04;
+/// Namespace secondary-index definition (non-empty value = JSON array of
+/// field names to index; empty = clear). Mirrors TAG_SCHEMA: namespace-scoped
+/// metadata, key empty, replicated through the log so every peer derives the
+/// same secondary index from the same values (the index itself is derived,
+/// never stored — only this definition replicates).
+pub const TAG_INDEX: u8 = 0x05;
 /// 64 MiB segment roll threshold.
 pub const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -110,7 +116,7 @@ impl Record {
             return Err(StorageError::Corrupt { ns: None, detail: "record shorter than header".into() });
         }
         let tag = bytes[0];
-        if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL && tag != TAG_SCHEMA {
+        if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL && tag != TAG_SCHEMA && tag != TAG_INDEX {
             return Err(StorageError::Corrupt { ns: None, detail: format!("bad record tag {tag:#x}") });
         }
         let declared_len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
@@ -315,7 +321,7 @@ impl Log {
                     break 'segments;
                 }
                 let tag = buf[pos];
-                if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL && tag != TAG_SCHEMA {
+                if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL && tag != TAG_SCHEMA && tag != TAG_INDEX {
                     // A bad tag is never a clean torn write end; refuse.
                     return Err(StorageError::Corrupt {
                         ns: Some(ns_from_dir(dir)),
