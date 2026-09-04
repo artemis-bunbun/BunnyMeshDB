@@ -7,6 +7,7 @@ use crate::caps::{Capability, PermSet, RevocationSet, Scope, Tier};
 use crate::core::ident::PublicKey;
 use crate::storage::{ConflictPolicy, Store};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,7 +53,13 @@ pub fn authorize(
     host_name: &str,
     now_ms: u64,
 ) -> Result<(), AuthError> {
-    authorize_cached(scope, principal, perms, caps, root, revocations, host_name, now_ms, None, 0)
+    // Test/fallback path (not hot): wrap owned caps into shared refs so the
+    // hot authorize_cached below never has to clone a Capability per request.
+    let mut arcs: Vec<Arc<Capability>> = Vec::new();
+    for c in caps {
+        arcs.push(Arc::new(c.clone()));
+    }
+    authorize_cached(scope, principal, perms, &arcs, root, revocations, host_name, now_ms, None, 0)
 }
 
 /// Like [`authorize`], but skips the per-request ed25519 signature check and
@@ -87,7 +94,7 @@ pub fn authorize_cached(
     scope: &Scope,
     principal: &PublicKey,
     perms: PermSet,
-    caps: &[Capability],
+    caps: &[Arc<Capability>],
     root: &PublicKey,
     revocations: &RevocationSet,
     host_name: &str,
@@ -117,16 +124,16 @@ pub fn authorize_cached(
         Tier::L1 => {
             // L1 caps must be host-root admin scope.
             for cap in caps {
-                let cached_ok = epoch_ok(cache.as_deref(), &cap.nonce, epoch);
-                let ok = cap.tier_ok(Tier::L1)
-                    && cap.scope.tier == Tier::L1
-                    && cap.scope.ns == "*"
-                    && cap.perms.contains(PermSet::ADMIN)
-                    && cap
+                let cached_ok = epoch_ok(cache.as_deref(), &(*cap).nonce, epoch);
+                let ok = (*cap).tier_ok(Tier::L1)
+                    && (*cap).scope.tier == Tier::L1
+                    && (*cap).scope.ns == "*"
+                    && (*cap).perms.contains(PermSet::ADMIN)
+                    && (*cap)
                         .verify_or_cached(root, principal, revocations, now_ms, cached_ok)
                         .is_ok();
                 if ok {
-                    mark_verified(cache.as_deref(), &cap.nonce, epoch, cached_ok);
+                    mark_verified(cache.as_deref(), &(*cap).nonce, epoch, cached_ok);
                     return Ok(());
                 }
             }
@@ -134,17 +141,17 @@ pub fn authorize_cached(
         }
         Tier::L2 => {
             for cap in caps {
-                let cached_ok = epoch_ok(cache.as_deref(), &cap.nonce, epoch);
-                let valid = cap.verify_or_cached(root, principal, revocations, now_ms, cached_ok);
+                let cached_ok = epoch_ok(cache.as_deref(), &(*cap).nonce, epoch);
+                let valid = (*cap).verify_or_cached(root, principal, revocations, now_ms, cached_ok);
                 if valid.is_err() {
                     // Try the next cap; the request is only denied if none hold.
                     continue;
                 }
-                if cap.scope.tier == Tier::L2
-                    && cap.scope.covers(scope)
-                    && cap.perms.contains(perms)
+                if (*cap).scope.tier == Tier::L2
+                    && (*cap).scope.covers(scope)
+                    && (*cap).perms.contains(perms)
                 {
-                    mark_verified(cache.as_deref(), &cap.nonce, epoch, cached_ok);
+                    mark_verified(cache.as_deref(), &(*cap).nonce, epoch, cached_ok);
                     return Ok(());
                 }
             }

@@ -51,9 +51,11 @@ impl AppState {
 }
 
 /// Capabilities attached by the auth middleware (Some for L1/L2 bearer caps,
-/// None for headerless L3 requests).
+/// None for headerless L3 requests). Holds `Arc<Capability>` so the middleware
+/// passes the token-cache's shared capability straight through — no
+/// per-request deep clone of the whole capability (its strings/arrays).
 #[derive(Clone)]
-pub struct AuthCaps(pub Vec<Capability>);
+pub struct AuthCaps(pub Vec<Arc<Capability>>);
 
 // ---------- responses ----------
 
@@ -95,20 +97,21 @@ pub async fn auth_mw(
             // (sig, expiry, revocation) still runs in the authorize path.
             let digest = crate::caps::token_digest(h);
             let cap = match state.token_cache.get(&digest) {
-                Some(arc) => Ok((*arc).clone()),
+                Some(arc) => Ok(arc),
                 None => match parse_cap_header(h) {
                     Ok(cap) => {
                         let arc = std::sync::Arc::new(cap);
                         state.token_cache.put(digest, arc.clone());
-                        Ok((*arc).clone())
+                        Ok(arc)
                     }
                     Err(e) => Err(e),
                 },
             };
             match cap {
-                Ok(cap) => {
+                Ok(arc) => {
                     let mut req = req;
-                    req.extensions_mut().insert(Some(AuthCaps(vec![cap])));
+                    // Hand the shared Arc straight to the handler — no clone.
+                    req.extensions_mut().insert(Some(AuthCaps(vec![arc])));
                     next.run(req).await
                 }
                 Err(_) => err_json(StatusCode::UNAUTHORIZED, "invalid_capability"),
@@ -136,7 +139,7 @@ fn auth_l1_l2(
     let principal = caps
         .0
         .first()
-        .map(|c| c.subject)
+        .map(|c| (*c).subject)
         .ok_or_else(|| err_json(StatusCode::UNAUTHORIZED, "invalid_capability"))?;
     let revs = state.revocations.read();
     // Read the epoch AFTER taking the read lock: a concurrent revoke either

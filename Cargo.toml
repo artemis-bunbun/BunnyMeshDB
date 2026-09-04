@@ -32,3 +32,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [features]
 mimalloc = ["dep:mimalloc"]
+
+# For profiling: release-grade but with debug symbols (strip off), so perf can
+# resolve hot functions. Used only for measurement; not for shipping.
+[profile.perf]
+inherits = "release"
+strip = false
