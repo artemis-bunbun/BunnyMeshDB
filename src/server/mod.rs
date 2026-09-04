@@ -8,6 +8,7 @@ use crate::core::hlc::Hlc;
 use crate::core::ident::{Keypair, PublicKey};
 use crate::ns::{account_write, authorize_cached, ensure_l3_namespace, CapCache};
 use crate::query::{QueryCtx, eval};
+use crate::schema::{check_supported, validate_schema};
 use crate::storage::{ConflictPolicy, Entry, StorageError, Store, Version};
 use crate::util::{b64_encode, b64url_decode};
 use axum::extract::{Extension, Path, Query as AxumQuery, State};
@@ -317,6 +318,100 @@ struct IssueCapBody {
     to: Option<String>,
 }
 
+// ---------- JSON-Schema per namespace (admin) ----------
+
+/// GET /l1/namespaces/{ns}/schema — the active schema JSON, or 404 if unset.
+async fn l1_schema_get(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+) -> Response {
+    match auth_l1_l2(&state, caps.as_ref(), &l1_scope(&state), PermSet::ADMIN, now_ms()) {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let store = state.store.read();
+    match store.schema(&ns) {
+        Some(bytes) => {
+            let s = String::from_utf8_lossy(bytes).into_owned();
+            let v = serde_json::from_str::<JValue>(&s).unwrap_or(JValue::Null);
+            Json(v).into_response()
+        }
+        None => err_json(StatusCode::NOT_FOUND, "no_schema"),
+    }
+}
+
+/// POST /l1/namespaces/{ns}/schema — set the schema (body is the raw JSON
+/// Schema). Rejects unsupported keywords up front so enforcement is honest.
+async fn l1_schema_set(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    match auth_l1_l2(&state, caps.as_ref(), &l1_scope(&state), PermSet::ADMIN, now_ms()) {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let s = String::from_utf8_lossy(&body).into_owned();
+    let schema = match serde_json::from_str::<JValue>(&s) {
+        Ok(v) => v,
+        Err(_) => return err_json(StatusCode::BAD_REQUEST, "bad_json"),
+    };
+    match check_supported(&schema) {
+        Ok(()) => {}
+        Err(msg) => return err_json(StatusCode::BAD_REQUEST, format!("unsupported_schema: {msg}").as_str()),
+    }
+    let mut store = state.store.write();
+    if store.policy(&ns).is_none() {
+        return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
+    }
+    let hlc = Hlc::now().to_u64();
+    let rid = state.root.to_bytes();
+    match store.set_schema(&ns, Some(&body), hlc, rid, rid) {
+        Ok(seq) => {
+            drop(store);
+            state.notify_sync();
+            state.notify_change(&ns);
+            Json(json!({ "ok": true, "seq": seq })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(%e, "set schema");
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
+/// DELETE /l1/namespaces/{ns}/schema — clear the schema (validation off).
+async fn l1_schema_clear(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+) -> Response {
+    match auth_l1_l2(&state, caps.as_ref(), &l1_scope(&state), PermSet::ADMIN, now_ms()) {
+        Ok(_) => {}
+        Err(r) => return r,
+    }
+    let mut store = state.store.write();
+    if store.policy(&ns).is_none() {
+        return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
+    }
+    let hlc = Hlc::now().to_u64();
+    let rid = state.root.to_bytes();
+    match store.set_schema(&ns, None, hlc, rid, rid) {
+        Ok(seq) => {
+            drop(store);
+            state.notify_sync();
+            state.notify_change(&ns);
+            Json(json!({ "ok": true, "seq": seq })).into_response()
+        }
+        Err(e) => {
+            tracing::error!(%e, "clear schema");
+            err_json(StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        }
+    }
+}
+
 async fn l1_issue_cap(
     State(state): State<AppState>,
     Extension(caps): Extension<Option<AuthCaps>>,
@@ -417,11 +512,15 @@ async fn l1_revoke(
 }
 
 /// Authorize a data route (L2 cap or L3 owner), return the principal.
+/// `perms` is the minimum this request needs — GET readers pass
+/// `PermSet::READ` so a read-only cap can actually read (the old code
+/// demanded READ+WRITE on every data route, so read-only caps got 403).
 fn data_auth(
     state: &AppState,
     caps: Option<&AuthCaps>,
     ns: &str,
     key: &str,
+    perms: PermSet,
 ) -> Result<(PublicKey, Tier), Response> {
     let tier = if ns.starts_with("u/") { Tier::L3 } else { Tier::L2 };
     let scope = data_scope(tier, ns, key, &state.host_name);
@@ -429,7 +528,7 @@ fn data_auth(
     if tier == Tier::L3 {
         auth_l3(state, &scope, now).map(|p| (p, tier))
     } else {
-        auth_l1_l2(state, caps, &scope, PermSet::READ.union(PermSet::WRITE), now).map(|p| (p, tier))
+        auth_l1_l2(state, caps, &scope, perms, now).map(|p| (p, tier))
     }
 }
 
@@ -481,7 +580,7 @@ fn handle_scan(state: &AppState, caps: Option<&AuthCaps>, ns: &str, query: HashM
         Some(p) => p.clone(),
         None => return err_json(StatusCode::BAD_REQUEST, "bad_request"),
     };
-    match data_auth(state, caps, ns, "") {
+    match data_auth(state, caps, ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -511,7 +610,8 @@ fn handle_data(
     query: HashMap<String, String>,
     body: &[u8],
 ) -> Response {
-    let (principal, tier) = match data_auth(state, caps, ns, key) {
+    let perms = if method == Method::GET { PermSet::READ } else { PermSet::WRITE };
+    let (principal, tier) = match data_auth(state, caps, ns, key, perms) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -576,6 +676,19 @@ fn handle_data(
             }
             let hlc = Hlc::now().to_u64();
             let rid = state.root.to_bytes();
+            // Enforce the namespace JSON-Schema (if set) before commit.
+            if let Some(schema_bytes) = store.schema(ns) {
+                let src = String::from_utf8_lossy(schema_bytes).into_owned();
+                let schema = serde_json::from_str::<JValue>(&src).unwrap_or(JValue::Null);
+                let payload = String::from_utf8_lossy(body).into_owned();
+                match serde_json::from_str::<JValue>(&payload) {
+                    Ok(value) => match validate_schema(&schema, &value) {
+                        Ok(()) => {}
+                        Err(msg) => return err_json(StatusCode::BAD_REQUEST, format!("schema_violation: {msg}").as_str()),
+                    },
+                    Err(_) => return err_json(StatusCode::BAD_REQUEST, "schema_violation: value is not valid JSON"),
+                }
+            }
             // `?ttl=<secs>` sets a wall-clock expiry (0/absent = never).
             // Overflow on absurd values merely wraps → value reads already-expired.
             let expires_at = match query.get("ttl").and_then(|s| s.parse::<u64>().ok()) {
@@ -630,7 +743,7 @@ struct QlBody {
 }
 
 fn run_ql(state: &AppState, caps: Option<&AuthCaps>, ns: &str, expr: &str) -> Response {
-    match data_auth(state, caps, ns, "") {
+    match data_auth(state, caps, ns, "", PermSet::WRITE) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -675,7 +788,7 @@ async fn l2_head(
     Extension(caps): Extension<Option<AuthCaps>>,
     Path(ns): Path<String>,
 ) -> Response {
-    match data_auth(&state, caps.as_ref(), &ns, "") {
+    match data_auth(&state, caps.as_ref(), &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -695,7 +808,7 @@ async fn l2_changes(
     Path(ns): Path<String>,
     query: AxumQuery<HashMap<String, String>>,
 ) -> Response {
-    match data_auth(&state, caps.as_ref(), &ns, "") {
+    match data_auth(&state, caps.as_ref(), &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -735,7 +848,7 @@ async fn l3_head(
     Path(pk): Path<String>,
 ) -> Response {
     let ns = format!("u/{pk}");
-    match data_auth(&state, None, &ns, "") {
+    match data_auth(&state, None, &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -753,7 +866,7 @@ async fn l3_changes(
     query: AxumQuery<HashMap<String, String>>,
 ) -> Response {
     let ns = format!("u/{pk}");
-    match data_auth(&state, None, &ns, "") {
+    match data_auth(&state, None, &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -796,7 +909,7 @@ async fn l2_conflicts(
     Extension(caps): Extension<Option<AuthCaps>>,
     Path(ns): Path<String>,
 ) -> Response {
-    match data_auth(&state, caps.as_ref(), &ns, "") {
+    match data_auth(&state, caps.as_ref(), &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -821,7 +934,7 @@ async fn l3_conflicts(
     Path(pk): Path<String>,
 ) -> Response {
     let ns = format!("u/{pk}");
-    match data_auth(&state, None, &ns, "") {
+    match data_auth(&state, None, &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -852,7 +965,7 @@ async fn l2_events(
     Extension(caps): Extension<Option<AuthCaps>>,
     Path(ns): Path<String>,
 ) -> Response {
-    match data_auth(&state, caps.as_ref(), &ns, "") {
+    match data_auth(&state, caps.as_ref(), &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -865,7 +978,7 @@ async fn l3_events(
     Path(pk): Path<String>,
 ) -> Response {
     let ns = format!("u/{pk}");
-    match data_auth(&state, None, &ns, "") {
+    match data_auth(&state, None, &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -876,7 +989,7 @@ async fn l3_events(
 /// log head on every event for this namespace, stay connected until the
 /// broadcast channel closes (daemon shutdown).
 fn sse_events(state: AppState, ns: String) -> Response {
-    let mut rx = state.change_tx.subscribe();
+    let rx = state.change_tx.subscribe();
     let store = state.store.clone();
     let stream = futures::stream::unfold((rx, store, ns.clone()), |(mut rx, store, ns)| async move {
         loop {
@@ -902,6 +1015,7 @@ fn sse_events(state: AppState, ns: String) -> Response {
 pub fn app(state: AppState) -> Router {
     let protected = Router::new()
         .route("/l1/namespaces", get(l1_list_namespaces).post(l1_create_namespace))
+        .route("/l1/namespaces/{ns}/schema", get(l1_schema_get).post(l1_schema_set).delete(l1_schema_clear))
         .route("/l1/caps", get(l1_list_caps).post(l1_issue_cap))
         .route("/l1/revoke", post(l1_revoke))
         .route("/l2/{ns}", get(l2_scan))

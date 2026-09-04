@@ -33,6 +33,10 @@ pub const TAG_DEL: u8 = 0x02;
 /// PUT with a TTL: value is invalid after `expires_at` wall-clock ms.
 /// Same layout as TAG_PUT plus a trailing expires_at:u64 (0 = never).
 pub const TAG_PUT_TTL: u8 = 0x03;
+/// Namespace JSON-Schema set (non-empty value) or clear (empty value).
+/// Namespace-scoped metadata, not a user key: same wire layout as TAG_PUT
+/// (key is empty), never surfaced in scans/changes/change-feed.
+pub const TAG_SCHEMA: u8 = 0x04;
 /// 64 MiB segment roll threshold.
 pub const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -106,7 +110,7 @@ impl Record {
             return Err(StorageError::Corrupt { ns: None, detail: "record shorter than header".into() });
         }
         let tag = bytes[0];
-        if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL {
+        if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL && tag != TAG_SCHEMA {
             return Err(StorageError::Corrupt { ns: None, detail: format!("bad record tag {tag:#x}") });
         }
         let declared_len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
@@ -297,7 +301,7 @@ impl Log {
                     break 'segments;
                 }
                 let tag = buf[pos];
-                if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL {
+                if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL && tag != TAG_SCHEMA {
                     // A bad tag is never a clean torn write end; refuse.
                     return Err(StorageError::Corrupt {
                         ns: Some(ns_from_dir(dir)),

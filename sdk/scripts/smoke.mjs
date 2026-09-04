@@ -69,6 +69,32 @@ ok("conflicts endpoint works", Array.isArray(cf));
 const sc = await db.scan("k");
 ok("scan prefix", sc.some((e) => e.key === "k1"));
 
+// schema (admin set/clear + enforcement)
+const sc_schema = { type: "object", properties: { title: { type: "string", minLength: 1 } }, required: ["title"], additionalProperties: false };
+await client.setSchema("sdkdemo", sc_schema);
+ok("setSchema ok", true);
+const got = await client.getSchema("sdkdemo");
+ok("getSchema roundtrip", JSON.stringify(got) === JSON.stringify(sc_schema));
+let schemaThrew = false;
+try {
+  await db.put("bad", `{"x":1}`);
+} catch (e) {
+  schemaThrew = e instanceof BunnyMeshError && String(e.error).startsWith("schema_violation");
+}
+ok("schema violation → 400 schema_violation", schemaThrew);
+await db.put("good", `{"title":"hi"}`);
+ok("schema-conforming put ok", (await db.getText("good")) === `{"title":"hi"}`);
+await client.clearSchema("sdkdemo");
+ok("clearSchema → getSchema null", (await client.getSchema("sdkdemo")) === null);
+// unsupported keyword rejected at set
+let unsup = false;
+try {
+  await client.setSchema("sdkdemo", { type: "string", pattern: "^a" });
+} catch (e) {
+  unsup = e instanceof BunnyMeshError && e.status === 400 && String(e.error).startsWith("unsupported_schema");
+}
+ok("unsupported pattern rejected → 400", unsup);
+
 // errors: bad token → 401 BunnyError
 let threw = false;
 try {

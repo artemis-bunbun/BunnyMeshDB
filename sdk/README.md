@@ -56,7 +56,10 @@ for (const c of changes) console.log(c.seq, c.key, c.del ? "del" : "put");
 | `issueCap({scope, perms?, expiryMs?, to?})` | returns `{cap, token}` — use `token` as the `Authorization` bearer value |
 | `listCaps()` | capability ledger |
 | `revoke(scope, to)` | revoke a subject's capability |
-| `openL2(ns, opts?)` | issue an L2 cap (default `["read","write"]`) + return `DataClient` |
+| `setSchema(ns, schema)` | set per-namespace JSON-Schema (replicated) |
+| `getSchema(ns)` | active schema, or `null` when none is set |
+| `clearSchema(ns)` | clear the schema (validation off) |
+| `openL2(ns, opts?)` | issue an L2 cap (default `["read","write"]`) + return `DataClient`; `{ perms: ["read"] }` for a read-only client |
 | `data(ns, capOrToken)` | `DataClient` from an existing capability |
 | `l3(pk)` | `DataClient` for owner namespace `u/<pk>` (identity-gated) |
 
@@ -83,9 +86,25 @@ Errors: failed HTTP → `BunnyMeshError` (`status` + machine-readable `error`).
   pass the server's token through unmodified — re-encoding a parsed capability
   object would corrupt the u64 `nonce` through JS number precision and break
   the signature. Prefer wire-token strings over object round-trips.
-- **Data routes require `read|write` perms regardless of method.** A read-only
-  cap cannot GET (pre-existing server quirk). `openL2` defaults to
-  `["read","write"]` accordingly.
+- **Reads need only `read`; writes need `write`.** GET routes (get/scan/head/
+  changes/conflicts/subscribe) authorize on `read` alone, so a read-only cap
+  can read; PUT/DELETE and the query DSL require `write`. `openL2` defaults to
+  `["read","write"]`. (Previously every data route demanded both, so read-only
+  caps got 403 — fixed.)
+- **React Native.** The SDK runs on RN with no dependencies: its base64 and
+  UTF-8 codecs fall back to pure-JS implementations (`sdk/src/compat.ts`) when
+  `Buffer`/`atob`/`TextEncoder`/`TextDecoder` are absent, so the full non-
+  streaming surface (get/put/scan/ql/head/changes/conflicts/schema) works
+  unchanged. Live push `subscribe()` needs a `ReadableStream`-capable fetch,
+  which RN's runtime does not provide — use `changes(since)` polling for
+  real-time on RN (the method throws a clear, actionable error if you try).
+- **JSON-Schema** (`setSchema`/`getSchema`/`clearSchema`) is a replicated,
+  per-namespace server-side enforcement: the schema is a plain JS object, and
+  `put()` payloads must conform or the write is rejected with 400
+  `schema_violation`. The validated subset intentionally excludes `pattern`,
+  `format` and `$ref` (no audited regex engine on the server); unsupported
+  keywords are rejected at set time with 400 `unsupported_schema`, never
+  silently skipped.
 - **u64 precision.** HLC/nonce values beyond 2^53 arrive as strings (parsed
   through a safe reviver); `seq` is small and stays a number.
 - Values are raw bytes: the server does **not** JSON-encode on the wire; use

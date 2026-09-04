@@ -7,5 +7,6 @@ pub mod net;
 pub mod ns;
 pub mod util;
 pub mod query;
+pub mod schema;
 pub mod server;
 pub mod storage;

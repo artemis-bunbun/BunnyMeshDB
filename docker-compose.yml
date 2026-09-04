@@ -1,0 +1,46 @@
+# BunnyMeshDB: two mesh nodes in one compose stack.
+#
+#   docker compose up -d --build
+#   docker compose logs -f node-a        # first node's admin cap appears here
+#
+# Node names double as the authority in scope URLs (bmdb://node-a.../l2/...).
+# Peers dial each other over the compose network by service name (multiaddr
+# /dns4/<service>/tcp/<p2p>) — mesh is pull-based, so both must be up for a
+# sync round to complete. HTTP ports: node-a 8848, node-b 8849.
+
+services:
+  node-a:
+    build: .
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      test -f /data/data/meta.bin || bunnymeshdb init /data &&
+      exec bunnymeshdbd serve --config /etc/bmd/config-a.toml
+    volumes:
+      - nodea-data:/data
+      - ./examples/two-node/compose/config-a.toml:/etc/bmd/config-a.toml:ro
+      - nodea-cap:/var/run/bmd
+    ports:
+      - "8848:8848"
+      - "9100:9100"
+    restart: unless-stopped
+
+  node-b:
+    build: .
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      test -f /data/data/meta.bin || bunnymeshdb init /data &&
+      exec bunnymeshdbd serve --config /etc/bmd/config-b.toml
+    volumes:
+      - nodeb-data:/data
+      - ./examples/two-node/compose/config-b.toml:/etc/bmd/config-b.toml:ro
+      - nodeb-cap:/var/run/bmd
+    ports:
+      - "8849:8849"
+      - "9101:9101"
+    restart: unless-stopped
+
+volumes:
+  nodea-data:
+  nodeb-data:
+  nodea-cap:
+  nodeb-cap:

@@ -7,7 +7,7 @@
 
 pub mod log;
 
-use crate::storage::log::{Log, RecoverWarning, Record, TAG_DEL, TAG_PUT, TAG_PUT_TTL};
+use crate::storage::log::{Log, RecoverWarning, Record, TAG_DEL, TAG_PUT, TAG_PUT_TTL, TAG_SCHEMA};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -751,6 +751,18 @@ impl Store {
                 self.index.remove(&entry_key);
                 self.tombs.insert(entry_key, record.hlc);
             }
+            TAG_SCHEMA => {
+                // Namespace schema (metadata, not a user key). Empty value =
+                // clear. Stored in the snapshot-persisted meta map keyed by
+                // "schema/<ns>"; replicated through the log so every peer
+                // enforces the same shape.
+                let meta_key = format!("schema/{ns}");
+                if record.value.is_empty() {
+                    self.meta.remove(&meta_key);
+                } else {
+                    self.meta.insert(meta_key, record.value.clone());
+                }
+            }
             other => {
                 return Err(StorageError::Corrupt {
                     ns: Some(ns.to_string()),
@@ -842,6 +854,54 @@ impl Store {
     pub fn meta_set(&mut self, key: &str, value: Vec<u8>) {
         self.meta.insert(key.to_string(), value);
         self.revision += 1;
+    }
+
+    /// The namespace's active JSON-Schema (raw bytes), if set.
+    pub fn schema(&self, ns: &str) -> Option<&[u8]> {
+        let key = format!("schema/{ns}");
+        self.meta.get(&key).map(|v| v.as_slice())
+    }
+
+    /// Set (Some) or clear (None) a namespace schema. Appends a replicated
+    /// TAG_SCHEMA record to the namespace log so mesh peers enforce the same
+    /// shape, then updates the in-memory copy. Returns the record seq.
+    pub fn set_schema(
+        &mut self,
+        ns: &str,
+        value: Option<&[u8]>,
+        hlc: u64,
+        replica: [u8; 32],
+        author: [u8; 32],
+    ) -> Result<u64, StorageError> {
+        if !self.policies.contains_key(ns) {
+            return Err(StorageError::BadName(ns.to_string()));
+        }
+        let log = self
+            .logs
+            .get_mut(ns)
+            .ok_or(StorageError::NotFound(ns.to_string()))?;
+        let record = Record {
+            tag: TAG_SCHEMA,
+            key: Vec::new(),
+            hlc,
+            replica,
+            author,
+            value: value.map(|v| v.to_vec()).unwrap_or_default(),
+            expires_at: 0,
+        };
+        let bytes = record.to_bytes(log.head());
+        let seq = log.append(&bytes)?;
+        let meta_key = format!("schema/{ns}");
+        match value {
+            Some(v) => {
+                self.meta.insert(meta_key, v.to_vec());
+            }
+            None => {
+                self.meta.remove(&meta_key);
+            }
+        }
+        self.revision += 1;
+        Ok(seq)
     }
 
     pub fn set_peer_clock(&mut self, name: &str, diff: i64) {

@@ -1,6 +1,7 @@
 import type { Capability, ConflictPolicy, NamespaceInfo } from "./types.js";
 import { DataClient } from "./data.js";
 import { b64urlEncode, decodeCapToken, encodeCapToken } from "./encoding.js";
+import { utf8Encode } from "./compat.js";
 
 /** HTTP error carrying the server's machine-readable `error` string. */
 export class BunnyMeshError extends Error {
@@ -111,6 +112,41 @@ export class BunnyMeshClient {
     );
   }
 
+  /** Set a per-namespace JSON-Schema (replicated to every mesh peer, which
+   * then enforce it). `schema` is a plain JS object/array/boolean — the
+   * validated subset excludes `pattern`/`format`/`$ref` (no audited regex
+   * engine on the server); unsupported keywords are rejected with 400. */
+  async setSchema(ns: string, schema: unknown): Promise<void> {
+    await request(
+      this.baseUrl,
+      { method: "POST", path: `/l1/namespaces/${encodeURIComponent(ns)}/schema`, auth: this.admin, json: schema },
+      async () => undefined,
+    );
+  }
+
+  /** Clear the namespace schema (validation off). */
+  async clearSchema(ns: string): Promise<void> {
+    await request(
+      this.baseUrl,
+      { method: "DELETE", path: `/l1/namespaces/${encodeURIComponent(ns)}/schema`, auth: this.admin },
+      async () => undefined,
+    );
+  }
+
+  /** The active namespace schema, or `null` if none is set. */
+  async getSchema(ns: string): Promise<unknown> {
+    try {
+      return await request(
+        this.baseUrl,
+        { method: "GET", path: `/l1/namespaces/${encodeURIComponent(ns)}/schema`, auth: this.admin },
+        (res) => res.text().then(parseJson),
+      );
+    } catch (e) {
+      if (e instanceof BunnyMeshError && e.status === 404) return null;
+      throw e;
+    }
+  }
+
   /** Issue a capability and return it with its ready-to-send wire token.
    * The token encodes the server's raw JSON verbatim — re-encoding the
    * parsed object would corrupt the u64 nonce through JS number precision,
@@ -137,7 +173,7 @@ export class BunnyMeshClient {
       (res) => res.text(),
     );
     const cap = parseJson(raw) as Capability;
-    return { cap, token: `bmdb-cap:${b64urlEncode(new TextEncoder().encode(raw))}` };
+    return { cap, token: `bmdb-cap:${b64urlEncode(utf8Encode(raw))}` };
   }
 
   async listCaps(): Promise<Capability[]> {

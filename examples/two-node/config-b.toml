@@ -1,0 +1,15 @@
+[node]
+name = "node-b.bunnymeshdb.test"
+data_dir = "../../node-b/data"
+listen = "127.0.0.1:8851"
+p2p_listen = "9101"
+worker_threads = 2
+mesh_sync = true
+
+[node.l3]
+default_quota = 1048576
+
+[[peers]]
+name = "node-a.bunnymeshdb.test"
+addr = "/ip4/127.0.0.1/tcp/9100"
+pin = "94396dc2d4d417230a1263e54286190e7a018262ded3ec56d5b804fc3faa140c"

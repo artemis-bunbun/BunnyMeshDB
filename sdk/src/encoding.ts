@@ -1,48 +1,36 @@
-/** Base64 helpers (Node + browser) and capability-token encoding. */
+/** Base64 helpers (Node + browser + React Native) and capability-token
+ * encoding. Delegates to `compat.ts` for RN where Buffer/atob/TextEncoder
+ * are absent. */
 
 import type { Capability } from "./types.js";
+import { b64urlEncode as compatB64url, b64Decode as compatB64Decode, utf8Encode, utf8Decode } from "./compat.js";
 
-const te = new TextEncoder();
-const td = new TextDecoder();
-
-function hasBuffer(): boolean {
-  return typeof Buffer !== "undefined";
-}
-
+/** URL-safe base64 (unpadded) — platform-agnostic. */
 export function b64urlEncode(data: Uint8Array): string {
-  if (hasBuffer()) return Buffer.from(data).toString("base64url").replace(/=+$/, "");
-  let bin = "";
-  for (const b of data) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return compatB64url(data);
 }
 
-/** Standard-base64 decode, tolerant of URL-safe characters and missing
+/** Standard-base64 decode, tolerant of URL-safe characters + missing
  * padding (the server emits both flavors). */
 export function b64Decode(s: string): Uint8Array {
-  const std = s.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
-  const pad = std + "=".repeat((4 - (std.length % 4)) % 4);
-  if (hasBuffer()) return new Uint8Array(Buffer.from(pad, "base64"));
-  const bin = atob(pad);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
+  return compatB64Decode(s);
 }
 
 export function utf8(data: Uint8Array | string): Uint8Array {
-  return typeof data === "string" ? te.encode(data) : data;
+  return typeof data === "string" ? utf8Encode(data) : data;
 }
 
 export function decodeUtf8(data: Uint8Array): string {
-  return td.decode(data);
+  return utf8Decode(data);
 }
 
 /** Wire token: `bmdb-cap:` + unpadded base64url(cap JSON). */
 export function encodeCapToken(cap: Capability): string {
-  return "bmdb-cap:" + b64urlEncode(te.encode(JSON.stringify(cap)));
+  return "bmdb-cap:" + b64urlEncode(utf8Encode(JSON.stringify(cap)));
 }
 
 export function decodeCapToken(token: string): Capability {
   if (!token.startsWith("bmdb-cap:")) throw new Error("not a bmdb capability token (expected 'bmdb-cap:…')");
-  const json = new TextDecoder().decode(b64Decode(token.slice("bmdb-cap:".length)));
+  const json = utf8Decode(b64Decode(token.slice("bmdb-cap:".length)));
   return JSON.parse(json) as Capability;
 }

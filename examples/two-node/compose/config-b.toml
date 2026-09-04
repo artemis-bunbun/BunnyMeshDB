@@ -1,0 +1,16 @@
+# BunnyMeshDB compose-node config: node B (see config-a.toml).
+
+[node]
+name = "node-b"
+data_dir = "/data/data"
+listen = "0.0.0.0:8849"
+p2p_listen = "9101"
+worker_threads = 2
+mesh_sync = true
+
+[node.l3]
+default_quota = 1048576
+
+[[peers]]
+name = "node-a"
+addr = "/dns4/node-a/tcp/9100"

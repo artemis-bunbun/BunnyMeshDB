@@ -1,4 +1,5 @@
 import { BunnyMeshError, parseJson, request } from "./client.js";
+import { StreamUtf8 } from "./compat.js";
 import { b64Decode, decodeUtf8, utf8 } from "./encoding.js";
 import type { Change, ChangesResponse, ConflictEntry, Head, PutResult, ScanEntry, VersionInfo } from "./types.js";
 
@@ -171,14 +172,20 @@ export class DataClient {
       const text = await res.text().catch(() => res.statusText);
       throw new BunnyMeshError(res.status, text, "GET", `${this.base}/events`);
     }
-    const reader = res.body?.getReader();
-    if (!reader) throw new Error("BunnyMeshDB: no response body for events stream");
-    const decoder = new TextDecoder();
+    const body = res.body;
+    if (typeof body?.getReader !== "function") {
+      throw new Error(
+        "BunnyMeshDB: live push needs a ReadableStream-capable fetch (unavailable on this React Native runtime). " +
+          "Fall back to changes(since) polling for real-time on RN.",
+      );
+    }
+    const reader = body.getReader();
+    const decoder = new StreamUtf8();
     let buf = "";
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, { stream: true });
+      buf += decoder.feed(value);
       let idx: number;
       while ((idx = buf.indexOf("\n\n")) !== -1) {
         const frame = buf.slice(0, idx);

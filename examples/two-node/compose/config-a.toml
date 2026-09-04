@@ -1,0 +1,17 @@
+# BunnyMeshDB compose-node configs: same shape as the localhost pair, but
+# node names are the compose service FQDNs and peers dial by service name.
+
+[node]
+name = "node-a"
+data_dir = "/data/data"
+listen = "0.0.0.0:8848"
+p2p_listen = "9100"
+worker_threads = 2
+mesh_sync = true
+
+[node.l3]
+default_quota = 1048576
+
+[[peers]]
+name = "node-b"
+addr = "/dns4/node-b/tcp/9100"
