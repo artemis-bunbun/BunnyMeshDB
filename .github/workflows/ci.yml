@@ -11,8 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build (release, zero warnings check)
-        run: cargo build --release 2>&1 | tee build.log; ! grep -E 'warning|error' build.log
+      - name: Build (release, warnings denied in-crate)
+        # src has `#![deny(warnings)]` on the lib + both bins, so the
+        # compiler treats any warning in OUR code as an error — no fragile
+        # log-scan, and dependency warnings never fail the build.
+        run: cargo build --release
       - name: Test
         run: cargo test --release
 

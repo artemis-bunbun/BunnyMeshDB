@@ -1,5 +1,6 @@
 //! `bunnymeshdbd` — the server daemon: config → store → HTTP API.
 //! Checkpoints on SIGINT/SIGTERM and every 60 s.
+#![deny(warnings)]
 
 use bunnymeshdb::caps::{Capability, PermSet, RevocationSet, RootKeyring, Scope, Tier};
 use bunnymeshdb::core::ident::PublicKey;

@@ -128,7 +128,7 @@ mod tests {
 
     fn keyring_of(dir: &PathBuf) -> RootKeyring {
         let new_kp = meta::load(&*dir).unwrap();
-        let mut store = Store::open(&*dir).unwrap();
+        let store = Store::open(&*dir).unwrap();
         let retired = match store.meta_get("sys/root_chain") {
             Some(v) => RootKeyring::parse_chain(v),
             None => Vec::new(),

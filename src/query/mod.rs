@@ -490,14 +490,9 @@ mod tests {
         d
     }
 
-    fn ctx(store: &mut Store) -> QueryCtx {
+    fn ctx<'a>(store: &'a mut Store) -> QueryCtx<'a> {
         let host = PublicKey::from_bytes([9u8; 32]);
         QueryCtx { store, scope: None, host_id: host }
-    }
-
-    fn eval_str(store: &mut Store, src: &str) -> String {
-        let mut c = ctx(store);
-        eval(&mut c, src).map(|v| v.json()).unwrap_or_else(|e| format!("ERR {e:?}"))
     }
 
     #[test]

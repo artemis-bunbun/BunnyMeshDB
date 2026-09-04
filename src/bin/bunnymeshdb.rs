@@ -1,5 +1,6 @@
 //! `bunnymeshdb` — the user-facing CLI: init a node directory, or run a REPL
 //! against a data dir.
+#![deny(warnings)]
 
 use bunnymeshdb::core::meta;
 use bunnymeshdb::query::{QueryCtx, eval};

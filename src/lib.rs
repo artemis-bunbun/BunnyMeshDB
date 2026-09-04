@@ -1,4 +1,8 @@
 //! BunnyMeshDB library crate: core, storage, query (bins are thin shells).
+//! Warnings are denied (treated as errors) for this crate only — the
+//! compiler enforces the zero-warning rule rather than a log-scan in CI, and
+//! dependency warnings never break the build.
+#![deny(warnings)]
 
 pub mod caps;
 pub mod core;
