@@ -154,7 +154,8 @@ See `sdk/README.md` for the full surface.
   `GET /l2/{ns}?prefix=`, `/head`, `/changes?since=`, `/conflicts`,
   `/events?since=` (SSE push, auto-resumes from the last seen seq),
   `/ql`.
-- L3 (owner-identity-gated): `u/{pk}` variants of the data routes.
+- L3 (capability-scoped to the `u/{pk}` owner — the path alone is not a
+  credential): `u/{pk}` variants of the data routes.
 - `GET /metrics` (open): runtime counters — requests, writes, namespaces.
 
 **Secondary indexes / query.** Values are JSON. Define indexed fields per

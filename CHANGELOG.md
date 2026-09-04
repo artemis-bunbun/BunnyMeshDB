@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2.0
+
+Ops polish + security hardening since `v0.1.0`, with expanded query power.
+
+### Security
+- **L3 authorization fix** (was unauthorized write/read to any `u/<pk>`):
+  previously `auth_l3` derived the subject pk **from the URL**, so
+  `is_l3_owner` was a tautology and the L3 "user sandbox" was completely
+  open — any anonymous client could PUT/GET/scan any principal's namespace
+  without holding its key. Now L3 requires a host-signed capability scoped
+  to `u/<pk>` **bound to that principal** (subject == pk), verified through
+  the same path as L2. The `u/<pk>` path alone is not a credential. The SDK
+  `l3(pk)` mints the owner-bound cap. Verified live: anonymous write → 401,
+  owner (minted cap) works, a cap for principal A → 403 on B's namespace.
+- **CI hardening**: in-crate `#![deny(warnings)]` replaces a brittle log-scan;
+  fixed a hardcoded absolute path in the RN-compat test and a musl step that
+  couldn't compile on stock runners; made mesh assertions deterministic.
+- Found + fixed a latent mesh bug: `verify_batch` refused `TAG_SCHEMA`/`TAG_INDEX`
+  records, silently blocking schema/index replication across peers.
+
+### New
+- **Secondary indexes + indexed queries**: define indexed fields (`/l1/.../index`
+  or `index_create`), query with `by_index("field","value")`. Definition
+  replicates; the index is derived from values on every peer, so `by_index`
+  converges across the mesh without racing.
+- **Root key rotation** (`bunnymeshdb rotate-key`): graceful roll keeping
+  predecessors valid, or `--drop-predecessor` for compromise recovery;
+  `--reissue-admin` keeps admin access. Offline op.
+- **Rate limiting** (on by default, `node.ratelimit`), **live peer
+  management** (`GET|POST|DELETE /l1/peers`), **metrics**, **auto-compact/
+  TTL GC** (`node.gc_interval_secs`), resumable SSE, `durable_writes`.
+
+Per-commit detail: `d9129b8` (indexes), `6e86a55`/`2a4b0c3`/`7946460`/`c977c8c`
+(CI + ops), `51ac3c2` (mesh flakes).
+
 ## v0.1.0
 
 First tagged release: the self-hosted, multi-master Rust engine + zero-dep
@@ -71,26 +106,3 @@ Commit that added `TAG_SCHEMA` changed the on-disk log record set (the
 are unchanged and still replay.
 
 Full history: see git log. Repo: `github.com/artemis-bunbun/BunnyMeshDB`.
-
-## unreleased
-
-- **Secondary indexes + indexed queries**: define indexed fields per namespace
-  (`/l1/namespaces/{ns}/index`, or `index_create` in `/ql`); the engine
-  derives an in-memory secondary index from JSON-stored values and answers
-  `by_index("field", "value")` in sorted order. The definition replicates
-  through the mesh (an `index@`-style `TAG_INDEX` log record, mirroring
-  JSON-Schema), and the index itself is derived from values on every peer —
-  so `by_index` converges across nodes without racing (values converge →
-  derived indexes converge). Index maintenance rides the put/delete/synced
-  apply paths and rebuilds on open. 1 new unit test (65 total) + 4 integration
-  assertions (18/18).
-- **Root key rotation** (`bunnymeshdb rotate-key <data-dir>`): swap the active
-  ed25519 keypair without bricking the deployment. Graceful mode keeps the
-  previous key valid (a `RootKeyring` on the verification path accepts current
-  + retired predecessors, so already-issued capabilities and records keep
-  verifying; new caps mint with the fresh key). `--drop-predecessor` severs
-  the old key — the compromise-recovery path where its caps are all invalid
-  and must be re-issued; `--reissue-admin` re-signs the persisted admin cap so
-  the operator isn't locked out. Persists retired keys in `sys/root_chain`;
-  chain is written before meta.bin so a crash is re-runnable. Offline op
-  (daemon stopped).

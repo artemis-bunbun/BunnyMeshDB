@@ -64,7 +64,7 @@ for (const c of changes) console.log(c.seq, c.key, c.del ? "del" : "put");
 | `clearIndex(ns)` | clear the secondary-index definition |
 | `openL2(ns, opts?)` | issue an L2 cap (default `["read","write"]`) + return `DataClient`; `{ perms: ["read"] }` for a read-only client |
 | `data(ns, capOrToken)` | `DataClient` from an existing capability |
-| `l3(pk)` | `DataClient` for owner namespace `u/<pk>` (identity-gated) |
+| `l3(pk, opts?)` | `DataClient` for owner namespace `u/<pk>` — mints a cap bound to `pk` (L3 is capability-gated, not the bare path) |
 
 ### `DataClient` (namespace operations)
 | method | description |

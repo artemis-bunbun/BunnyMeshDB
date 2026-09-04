@@ -34,11 +34,6 @@ impl std::fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
-/// Is a scope's namespace the L3 owner form `u/<hex>` with principal as owner?
-pub fn is_l3_owner(scope: &Scope, principal: &PublicKey) -> bool {
-    scope.ns == format!("u/{}", principal)
-}
-
 /// Authorize `perms` on `scope` for `principal`.
 ///
 /// `host_name` is the configured node name — scope.host must match, otherwise
@@ -110,16 +105,31 @@ pub fn authorize_cached(
     }
     match scope.tier {
         Tier::L3 => {
-            // L3 is self-identity: principal must be the u/<pk> owner.
-            if is_l3_owner(scope, principal) {
-                Ok(())
-            } else {
-                Err(AuthError::Forbidden(format!(
-                    "L3 scope {} is not owned by {}",
-                    scope,
-                    principal
-                )))
+            // L3 is a principal's personal sandbox (`u/<pk>`). It requires a
+            // host-signed capability bound to that principal — subject must be
+            // the `u/<pk>` owner and the scope must cover this namespace — so
+            // a cap minted for one principal can never address another's
+            // `u/<pk>`. Same verification as L2 (issuer in keyring, sig,
+            // expiry, revocation, epoch cache). No header/URL oracle: the pk
+            // is not a credential by itself.
+            for cap in caps {
+                let cached_ok = epoch_ok(cache.as_deref(), &(*cap).nonce, epoch);
+                let valid = (*cap).verify_or_cached(keyring, principal, revocations, now_ms, cached_ok);
+                if valid.is_err() {
+                    continue;
+                }
+                if (*cap).scope.tier == Tier::L3
+                    && (*cap).scope.covers(scope)
+                    && format!("u/{}", (*cap).subject) == scope.ns
+                    && (*cap).perms.contains(perms)
+                {
+                    mark_verified(cache.as_deref(), &(*cap).nonce, epoch, cached_ok);
+                    return Ok(());
+                }
             }
+            Err(AuthError::Unauthorized(format!(
+                "no capability covers {scope} for its owner"
+            )))
         }
         Tier::L1 => {
             // L1 caps must be host-root admin scope.
@@ -261,14 +271,41 @@ mod tests {
         let owner = Keypair::generate();
         let other = Keypair::generate();
         let s = scope(&format!("bmdb://api.test/l3/u/{}", owner.public()));
-        assert!(authorize(&s, &owner.public(), PermSet::WRITE, &[], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()).is_ok());
+        let kr = RootKeyring::current(root.public());
+        let rev = RevocationSet::new();
+        // The u/<pk> path alone is NOT a credential: no capability → denied.
         assert!(matches!(
-            authorize(&s, &other.public(), PermSet::WRITE, &[], &RootKeyring::current(root.public()), &RevocationSet::new(), "api.test", now_ms()),
-            Err(AuthError::Forbidden(_))
+            authorize(&s, &owner.public(), PermSet::WRITE, &[], &kr, &rev, "api.test", now_ms()),
+            Err(AuthError::Unauthorized(_))
         ));
-        // L3 cap is not a thing — other host's name is rejected.
+        // A cap bound to the owner (scope u/<pk>, subject=owner) grants access.
+        let owner_cap = Capability::sign_for(
+            s.clone(),
+            PermSet::READ.union(PermSet::WRITE),
+            Some(now_ms() + 60_000),
+            1,
+            owner.public(),
+            &root,
+        );
+        assert!(authorize(&s, &owner.public(), PermSet::WRITE, &[owner_cap.clone()], &kr, &rev, "api.test", now_ms()).is_ok());
+        // A cap bound to a DIFFERENT principal cannot reach the owner's ns,
+        // even though that principal's own scope url matches a u/<pk>.
+        let other_cap_scope = scope(&format!("bmdb://api.test/l3/u/{}", other.public()));
+        let other_cap = Capability::sign_for(
+            other_cap_scope,
+            PermSet::READ.union(PermSet::WRITE),
+            Some(now_ms() + 60_000),
+            2,
+            other.public(),
+            &root,
+        );
         assert!(matches!(
-            authorize(&s, &owner.public(), PermSet::WRITE, &[], &RootKeyring::current(root.public()), &RevocationSet::new(), "other.test", now_ms()),
+            authorize(&s, &other.public(), PermSet::WRITE, &[other_cap], &kr, &rev, "api.test", now_ms()),
+            Err(AuthError::Unauthorized(_))
+        ));
+        // Other host's name is rejected.
+        assert!(matches!(
+            authorize(&s, &owner.public(), PermSet::WRITE, &[owner_cap.clone()], &kr, &rev, "other.test", now_ms()),
             Err(AuthError::Unauthorized(_))
         ));
     }

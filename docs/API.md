@@ -3,7 +3,9 @@
 All endpoints are relative to a node's HTTP `listen` address. Capabilities
 are bearer tokens: `Authorization: Bearer bmdb-cap:…`. Admin (L1) routes need
 `admin` on the L1 scope; data (L2) routes need `read` (GET) or `write`
-(PUT/DELETE/QL); L3 routes are identity-gated (`u/<pk>`).
+(PUT/DELETE/QL); L3 routes are capability-gated too — the `u/{pk}` path alone
+is not a credential, access needs a cap scoped to `u/{pk}` bound to that
+principal.
 
 `GET /healthz` and `GET /metrics` are open (no auth).
 
@@ -65,7 +67,8 @@ Remove a peer. 404 `peer_not_found`.
 ## Data (L2/L3)
 
 L2: `Authorization: Bearer bmdb-cap:…` scoped `l2/{ns}`.
-L3: `u/{pk}` namespace, headerless, identity-gated by the host key.
+L3: `u/{pk}` namespace, `Authorization: Bearer bmdb-cap:…` scoped
+`l3/u/{pk}` and bound to the owning principal (subject == `pk`).
 
 ### `GET|PUT|DELETE /{tier}/{ns}/{*key}`
 - `GET` → raw value bytes (the value is **not** JSON-encoded by the server);

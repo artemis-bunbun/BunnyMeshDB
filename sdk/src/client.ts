@@ -238,9 +238,14 @@ export class BunnyMeshClient {
     return new DataClient(this.baseUrl, ns, token);
   }
 
-  /** L3 owner namespace `u/<pk>` — identity-gated, no capability needed
-   * when the caller holds the host key named by `<pk>`. */
-  l3(pk: string): DataClient {
-    return new DataClient(this.baseUrl, `u/${pk}`, null);
+  /** L3 owner namespace `u/<pk>`. L3 is capability-gated like L2: this
+   * mints a cap scoped to the namespace with `subject` = the owning `pk`, so
+   * only a holder of that capability (issued by the admin/root) can access
+   * the namespace — the `u/<pk>` path alone is not a credential. */
+  async l3(pk: string, opts: { perms?: string[]; expiryMs?: number } = {}): Promise<DataClient> {
+    const host = scopeHost(decodeCapToken(this.admin));
+    const scope = `bmdb://${host}/l3/u/${pk}`;
+    const { token } = await this.issueCap({ scope, perms: opts.perms ?? ["read", "write"], expiryMs: opts.expiryMs, to: pk });
+    return new DataClient(this.baseUrl, `u/${pk}`, token);
   }
 }

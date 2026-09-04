@@ -217,21 +217,6 @@ fn auth_l1_l2(
     Ok(principal)
 }
 
-/// L3: principal = pk in the `u/<pk>` namespace; no header needed.
-fn auth_l3(state: &AppState, scope: &Scope, now_ms: u64) -> Result<PublicKey, Response> {
-    let pk_hex = scope
-        .ns
-        .strip_prefix("u/")
-        .ok_or_else(|| err_json(StatusCode::FORBIDDEN, "forbidden"))?;
-    let pk = pk_hex
-        .parse::<PublicKey>()
-        .map_err(|_| err_json(StatusCode::FORBIDDEN, "forbidden"))?;
-    let revs = state.revocations.read();
-    authorize_cached(scope, &pk, PermSet::READ.union(PermSet::WRITE), &[], &state.keyring, &revs, &state.host_name, now_ms, None, 0)
-        .map_err(auth_to_response)?;
-    Ok(pk)
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -668,7 +653,7 @@ async fn l1_issue_cap(
         Err(r) => return r,
     };
     let target = match Scope::parse(&body.scope) {
-        Ok(s) if s.tier == Tier::L2 && s.host == state.host_name => s,
+        Ok(s) if (s.tier == Tier::L2 || s.tier == Tier::L3) && s.host == state.host_name => s,
         _ => return err_json(StatusCode::BAD_REQUEST, "bad_request"),
     };
     let perms = match PermSet::parse_list(&body.perms) {
@@ -771,11 +756,10 @@ fn data_auth(
     let tier = if ns.starts_with("u/") { Tier::L3 } else { Tier::L2 };
     let scope = data_scope(tier, ns, key, &state.host_name);
     let now = now_ms();
-    if tier == Tier::L3 {
-        auth_l3(state, &scope, now).map(|p| (p, tier))
-    } else {
-        auth_l1_l2(state, caps, &scope, perms, now).map(|p| (p, tier))
-    }
+    // L3 uses the same capability-machinery as L2: the presented cap must be
+    // L3-scoped to this exact namespace and subject-bound to its owner (see
+    // authorize_cached's Tier::L3 arm). There is no headerless identity path.
+    auth_l1_l2(state, caps, &scope, perms, now).map(|p| (p, tier))
 }
 
 async fn l2_data(
@@ -791,14 +775,14 @@ async fn l2_data(
 
 async fn l3_data(
     State(state): State<AppState>,
-    Extension(_caps): Extension<Option<AuthCaps>>,
+    Extension(caps): Extension<Option<AuthCaps>>,
     method: Method,
     Path((pk, key)): Path<(String, String)>,
     _query: AxumQuery<HashMap<String, String>>,
     body: axum::body::Bytes,
 ) -> Response {
     let ns = format!("u/{pk}");
-    handle_data(&state, None, &ns, &key, method, _query.0, &body)
+    handle_data(&state, caps.as_ref(), &ns, &key, method, _query.0, &body)
 }
 
 /// GET /l2/{ns}?prefix= — scan form (no key segment).
@@ -814,11 +798,11 @@ async fn l2_scan(
 /// GET /l3/u/{pk}?prefix= — scan form.
 async fn l3_scan(
     State(state): State<AppState>,
-    Extension(_caps): Extension<Option<AuthCaps>>,
+    Extension(caps): Extension<Option<AuthCaps>>,
     Path(pk): Path<String>,
     query: AxumQuery<HashMap<String, String>>,
 ) -> Response {
-    handle_scan(&state, None, &format!("u/{pk}"), query.0)
+    handle_scan(&state, caps.as_ref(), &format!("u/{pk}"), query.0)
 }
 
 fn handle_scan(state: &AppState, caps: Option<&AuthCaps>, ns: &str, query: HashMap<String, String>) -> Response {
@@ -1020,11 +1004,11 @@ async fn ql_l2(
 
 async fn ql_l3(
     State(state): State<AppState>,
-    Extension(_caps): Extension<Option<AuthCaps>>,
+    Extension(caps): Extension<Option<AuthCaps>>,
     Path(pk): Path<String>,
     Json(body): Json<QlBody>,
 ) -> Response {
-    run_ql(&state, None, &format!("u/{pk}"), &body.expr)
+    run_ql(&state, caps.as_ref(), &format!("u/{pk}"), &body.expr)
 }
 
 // ---------- change feed ----------
@@ -1092,11 +1076,11 @@ async fn l2_changes(
 /// L3 owner-namespace variants (no capability — identity is the namespace).
 async fn l3_head(
     State(state): State<AppState>,
-    Extension(_caps): Extension<Option<AuthCaps>>,
+    Extension(caps): Extension<Option<AuthCaps>>,
     Path(pk): Path<String>,
 ) -> Response {
     let ns = format!("u/{pk}");
-    match data_auth(&state, None, &ns, "", PermSet::READ) {
+    match data_auth(&state, caps.as_ref(), &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -1109,12 +1093,12 @@ async fn l3_head(
 
 async fn l3_changes(
     State(state): State<AppState>,
-    Extension(_caps): Extension<Option<AuthCaps>>,
+    Extension(caps): Extension<Option<AuthCaps>>,
     Path(pk): Path<String>,
     query: AxumQuery<HashMap<String, String>>,
 ) -> Response {
     let ns = format!("u/{pk}");
-    match data_auth(&state, None, &ns, "", PermSet::READ) {
+    match data_auth(&state, caps.as_ref(), &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -1178,11 +1162,11 @@ async fn l2_conflicts(
 
 async fn l3_conflicts(
     State(state): State<AppState>,
-    Extension(_caps): Extension<Option<AuthCaps>>,
+    Extension(caps): Extension<Option<AuthCaps>>,
     Path(pk): Path<String>,
 ) -> Response {
     let ns = format!("u/{pk}");
-    match data_auth(&state, None, &ns, "", PermSet::READ) {
+    match data_auth(&state, caps.as_ref(), &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }
@@ -1224,12 +1208,12 @@ async fn l2_events(
 
 async fn l3_events(
     State(state): State<AppState>,
-    Extension(_caps): Extension<Option<AuthCaps>>,
+    Extension(caps): Extension<Option<AuthCaps>>,
     Path(pk): Path<String>,
     query: AxumQuery<HashMap<String, String>>,
 ) -> Response {
     let ns = format!("u/{pk}");
-    match data_auth(&state, None, &ns, "", PermSet::READ) {
+    match data_auth(&state, caps.as_ref(), &ns, "", PermSet::READ) {
         Ok(_) => {}
         Err(r) => return r,
     }

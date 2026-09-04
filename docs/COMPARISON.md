@@ -32,7 +32,7 @@ against the tool a developer would otherwise reach for.
 |---|---|---|
 | Throughput | ~240-278k GET/s single-node (mimalloc/musl) | SQLite similar order for reads, different workload |
 | Concurrency model | Single-writer log append, snapshot index | Fine-grained queries, mature MVCC |
-| Query language | Tiny DSL (`get/put/scan/ql`), no JOIN | Full SQL |
+| Query language | Indexed DSL (`by_index`/`scan` + `ql`), no JOIN | Full SQL |
 | Durability default | No per-record fsync (loss of last write on crash) unless `durable_writes` | Rollback journal / WAL, ACID |
 | Conflict handling | LWW or multi-version register (optional) | N/A (single-writer) |
 | Ecosystem | None yet (SDK + docs only) | Massive |
@@ -49,10 +49,12 @@ against the tool a developer would otherwise reach for.
 ### vs. SQLite + sync (Litestream, turso/libSQL, Dolt)
 - **Pro:** true multi-master (not just replication to read replicas), conflict
   support (`register`/`versions`), capability auth, offline-first writes
-  (not just resilient reads).
+  (not just resilient reads), and replicated **secondary indexes** with
+  `by_index` — so a syncable app gets indexed point/equality reads without
+  bolting on a relational engine.
 - **Con:** no SQL, no MVCC, no rich transactions, no Azure/RDS-style managed
-  offering. For an app that needs relational queries, SQLite + a sync layer is
-  still the better fit.
+  offering. For an app that *needs* relational queries, SQLite + a sync layer
+  is still the better fit.
 
 ### vs. CouchDB / Couchbase / CouchDB-style
 - **Pro:** simpler model (plain KV, no map/reduce or views), capability

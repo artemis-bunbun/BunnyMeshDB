@@ -49,7 +49,9 @@ user-visible pin diffs, and cap chains that reference original-issuer keys.
 - Tiers are **checks on capability chains rooted at the host key**,
   evaluated locally and offline. No global user database, no central admin.
 - "L3 = people's own filesystems" falls out of the model: each principal
-  gets a personal namespace scoped by their key.
+  gets a personal namespace scoped by their key. Access requires a
+  host-signed capability whose **subject is that principal** and whose scope
+  is the `u/<pk>` namespace — the `u/<pk>` path alone is not a credential.
 - Absolute-privilege APIs live behind L1 and are host-local; they never
   replicate.
 
