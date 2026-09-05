@@ -263,7 +263,7 @@ fn main() {
                 }
             };
             let host_id = kp.public();
-            let mut ctx = QueryCtx { store: &mut store, scope: None, host_id };
+            let mut ctx = QueryCtx { store: &mut store, scope: None, host_id, remote: false };
             repl(&mut ctx);
         }
     }

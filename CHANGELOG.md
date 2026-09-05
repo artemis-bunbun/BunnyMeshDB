@@ -14,6 +14,13 @@ Ops polish + security hardening since `v0.1.0`, with expanded query power.
   the same path as L2. The `u/<pk>` path alone is not a credential. The SDK
   `l3(pk)` mints the owner-bound cap. Verified live: anonymous write → 401,
   owner (minted cap) works, a cap for principal A → 403 on B's namespace.
+- **HTTP `/ql` scope/privilege gate**: the ql DSL's `create_ns` (an L1/admin
+  op) ran under any L2 write capability — any write-cap holder could create
+  arbitrary namespaces (build `owned` namespaces / disk-fill); and a latent
+  `use` scope-escape would let a narrow cap read outside its grant. The
+  remote ql path now refuses `use`/`create_ns` (a `remote` flag on
+  `QueryCtx`); the REPL keeps them (local trusted). Verified live: create_ns
+  and use now return `query_error`, legit data fns still work, no rogue ns.
 - **CI hardening**: in-crate `#![deny(warnings)]` replaces a brittle log-scan;
   fixed a hardcoded absolute path in the RN-compat test and a musl step that
   couldn't compile on stock runners; made mesh assertions deterministic.

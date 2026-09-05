@@ -980,7 +980,7 @@ fn run_ql(state: &AppState, caps: Option<&AuthCaps>, ns: &str, expr: &str) -> Re
         Err(r) => return r,
     }
     let mut store = state.store.write();
-    let mut ctx = QueryCtx { store: &mut store, scope: Some(ns.to_string()), host_id: state.root };
+    let mut ctx = QueryCtx { store: &mut store, scope: Some(ns.to_string()), host_id: state.root, remote: true };
     match eval(&mut ctx, expr) {
         Ok(v) => {
             let j: JValue = serde_json::from_str(&v.json()).unwrap_or(JValue::Null);

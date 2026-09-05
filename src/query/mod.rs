@@ -60,6 +60,12 @@ pub struct QueryCtx<'a> {
     pub store: &'a mut Store,
     pub scope: Option<String>,
     pub host_id: PublicKey,
+    /// Set for the HTTP `/ql` path (cap-authenticated). When true, the
+    /// admin-privileged `use`/`create_ns` functions are refused: a remote
+    /// caller must not be able to move the DSL scope outside the namespace
+    /// its capability authorizes, nor create namespaces (an L1/admin op).
+    /// The REPL drives the store locally and keeps them.
+    pub remote: bool,
 }
 
 /// Evaluate a single expression.
@@ -103,6 +109,11 @@ fn exec(ctx: &mut QueryCtx, call: &Call) -> Result<Value, QueryError> {
         }
         "use" => {
             argc(call, 1)?;
+            if ctx.remote {
+                // Cap-authenticated /ql: the caller was authorized for the
+                // request's namespace; changing scope would escape it.
+                return Err(QueryError::Type("use() is not available over the HTTP ql API".to_string()));
+            }
             let ns = str_arg(ctx, &call.args[0])?;
             if ctx.store.policy(&ns).is_none() {
                 return Err(QueryError::Eval(StorageError::NotFound(ns)));
@@ -112,6 +123,11 @@ fn exec(ctx: &mut QueryCtx, call: &Call) -> Result<Value, QueryError> {
         }
         "create_ns" => {
             argc(call, 1)?;
+            if ctx.remote {
+                // Creating a namespace is an L1/admin operation; a remote
+                // caller must use the admin route, not the data ql API.
+                return Err(QueryError::Type("create_ns() is not available over the HTTP ql API".to_string()));
+            }
             let ns = str_arg(ctx, &call.args[0])?;
             ctx.store
                 .create_namespace(&ns, ConflictPolicy::Lww)
@@ -492,7 +508,7 @@ mod tests {
 
     fn ctx<'a>(store: &'a mut Store) -> QueryCtx<'a> {
         let host = PublicKey::from_bytes([9u8; 32]);
-        QueryCtx { store, scope: None, host_id: host }
+        QueryCtx { store, scope: None, host_id: host, remote: false }
     }
 
     #[test]
@@ -500,7 +516,7 @@ mod tests {
         let dir = tmpdir("fns");
         let mut s = Store::open(&dir).unwrap();
         let host = PublicKey::from_bytes([9u8; 32]);
-        let mut c = QueryCtx { store: &mut s, scope: None, host_id: host };
+        let mut c = QueryCtx { store: &mut s, scope: None, host_id: host, remote: false };
         let r = |c: &mut QueryCtx, src: &str| eval(c, src).map(|v| v.json());
         assert_eq!(r(&mut c, "create_ns(\"photos\")").unwrap(), "true");
         assert_eq!(r(&mut c, "use(\"photos\")").unwrap(), "true");
@@ -642,5 +658,34 @@ mod tests {
                 Value::List(vec![Value::Str("bob".into()), Value::Str("cyn".into())])
             );
         }
+    }
+
+    #[test]
+    fn remote_ql_cannot_escape_scope_or_create_ns() {
+        // The HTTP /ql path runs with `remote: true` (cap-scoped): admin
+        // ops must not be reachable through it. use() (scope escape) and
+        // create_ns() (L1 op) must error, while data fns still work.
+        let dir = tmpdir("remote");
+        {
+            let mut s = Store::open(&dir).unwrap();
+            let mut c = ctx(&mut s);
+            eval(&mut c, "create_ns(\"app\")").unwrap(); // local (REPL-like) can create
+            eval(&mut c, "use(\"app\")").unwrap(); // ...and use it locally
+            c.remote = true; // simulate the HTTP ql path
+            // create_ns (an L1 op) is refused remotely.
+            assert!(matches!(
+                eval(&mut c, "create_ns(\"evil\")"),
+                Err(QueryError::Type(_))
+            ));
+            // use() (scope escape) is refused remotely.
+            assert!(matches!(
+                eval(&mut c, "use(\"other\")"),
+                Err(QueryError::Type(_))
+            ));
+        }
+        // The remote caller could not create 'evil'.
+        let s = Store::open(&dir).unwrap();
+        assert!(s.policy("evil").is_none(), "remote create_ns must not create the ns");
+        assert!(s.policy("app").is_some(), "local create_ns still allowed");
     }
 }
