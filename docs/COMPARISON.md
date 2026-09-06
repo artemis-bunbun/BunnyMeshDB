@@ -30,7 +30,7 @@ against the tool a developer would otherwise reach for.
 
 | Concern | bunnymeshdb | Crafted-for comparison (SQLite) |
 |---|---|---|
-| Throughput | ~160-278k GET/s single-node, harness-dependent (see BENCHMARKS.md) | SQLite similar order for reads, different workload |
+| Throughput | ~155k serial GET/s; ~17M pipelined batch ops/s single-node (see BENCHMARKS.md) | SQLite similar order for reads, different workload |
 | Concurrency model | Single-writer log append, snapshot index | Fine-grained queries, mature MVCC |
 | Query language | Indexed DSL (`by_index`/`scan` + `ql`), no JOIN | Full SQL |
 | Durability default | No per-record fsync (loss of last write on crash) unless `durable_writes` | Rollback journal / WAL, ACID |

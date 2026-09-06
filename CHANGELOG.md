@@ -1,12 +1,15 @@
 # Changelog
 
-## Unreleased
+## v0.3.0
+
+Performance pipeline: batching, HTTP/2, limiter striping.
 
 ### Performance pipeline
 - **HTTP/2**: axum now builds with the `http2` feature; the TLS listener
-  advertises `h2` via ALPN (with `http/1.1` fallback). Verified live:
-  `curl --http2` over TLS negotiates `http_version=2` and serves
-  authenticated requests.
+  advertises `h2` via ALPN (with `http/1.1` fallback), and plaintext
+  listeners accept h2 by prior knowledge (h2c) as well — both verified
+  live (`curl --http2` / `--http2-prior-knowledge` negotiate version 2 and
+  serve authenticated requests).
 - **`POST /l2/{ns}/batch` + `/l3/u/{pk}/batch`**: pipelined batch ops —
   one capability verification, one rate-limit charge, one storage lock for
   up to 1000 ops. Reads observe a consistent batch prefix, per-op failures
