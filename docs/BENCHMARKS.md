@@ -47,3 +47,24 @@ cargo build --release --features mimalloc   # musl (Alpine/Docker)
 
 then run `GET /l2/{ns}/{key}` over 32 connections on a warm key. Exact
 figures depend on CPU and disk; the glibc-vs-musl ratio is the stable signal.
+
+## Reproduced (2026-09-06)
+
+Differential check with a serial keep-alive HTTP/1.1 client (std-only
+loadgen; 32 connections, one warm key, 3 s), same machine:
+
+| Binary | GET throughput |
+|---|---|
+| doc-era `b0dc71b` (when the table above was written) | ~150-152k ops/s |
+| current `HEAD` | ~157-165k ops/s |
+| current, rate limiting disabled | ~123-129k ops/s (noise) |
+
+Readings: the engine is unchanged since the original numbers — doc-era and
+current are statistically identical (spread ≲3%), and the v0.2.x auth /
+rate-limit work costs nothing measurable on the GET path (ON and OFF match;
+the small OFF dip is run-to-run noise). Absolute figures are lower than the
+table above because this client is **serial request/response**, bounded by
+per-request round-trip latency; the original generator batched more work per
+connection and hit ~278k. The stable signal remains the *relative*
+comparison (glibc vs musl, mimalloc on/off) — take any absolute number with
+the harness in mind.
