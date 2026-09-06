@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Performance pipeline
+- **HTTP/2**: axum now builds with the `http2` feature; the TLS listener
+  advertises `h2` via ALPN (with `http/1.1` fallback). Verified live:
+  `curl --http2` over TLS negotiates `http_version=2` and serves
+  authenticated requests.
+- **`POST /l2/{ns}/batch` + `/l3/u/{pk}/batch`**: pipelined batch ops —
+  one capability verification, one rate-limit charge, one storage lock for
+  up to 1000 ops. Reads observe a consistent batch prefix, per-op failures
+  don't abort, read-only caps are refused (write-gated like `/ql`). Native
+  client: **~17M ops/s batched (batch=300) vs ~155k serial GET/s — ~100×**
+  on the same machine; per-op quota/schema/TTL still enforced. SDK:
+  `DataClient.batch(ops)` → typed per-op results (`sdk/src/data.ts`).
+- **Rate limiter striped** across 64 shards (global bound preserved) so
+  distinct-token traffic no longer contends on one lock.
+
 ## v0.2.0
 
 Ops polish + security hardening since `v0.1.0`, with expanded query power.

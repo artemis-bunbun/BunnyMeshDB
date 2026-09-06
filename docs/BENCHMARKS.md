@@ -48,23 +48,33 @@ cargo build --release --features mimalloc   # musl (Alpine/Docker)
 then run `GET /l2/{ns}/{key}` over 32 connections on a warm key. Exact
 figures depend on CPU and disk; the glibc-vs-musl ratio is the stable signal.
 
-## Reproduced (2026-09-06)
+## Reproduced (2026-09-06, corrected 2026-09-07)
 
 Differential check with a serial keep-alive HTTP/1.1 client (std-only
-loadgen; 32 connections, one warm key, 3 s), same machine:
+loadgen; one warm key, 3 s), same machine, **authenticated with a real L2
+capability and verified `200` responses** (an earlier draft of this section
+measured the 403-forbidden path by mistake — a fixture bug where the seed
+PUT used the L1 admin cap, which cannot write L2; auth-path cost dominates
+both, so the numbers landed the same, but the corrected protocol below is
+the honest one):
 
-| Binary | GET throughput |
+| Scenario | Throughput |
 |---|---|
-| doc-era `b0dc71b` (when the table above was written) | ~150-152k ops/s |
-| current `HEAD` | ~157-165k ops/s |
-| current, rate limiting disabled | ~123-129k ops/s (noise) |
+| doc-era `b0dc71b` (original numbers), 32 conns | ~150-152k GET/s |
+| current `HEAD`, 32 / 64 / 128 conns | 155-157k GET/s (flat) |
+| batch `POST /l2/{ns}/batch`, 100 ops × 8-16 conns | ~12.5-13.1M ops/s |
+| batch, 300 ops × 4 conns | **~17.4M ops/s** |
 
-Readings: the engine is unchanged since the original numbers — doc-era and
-current are statistically identical (spread ≲3%), and the v0.2.x auth /
-rate-limit work costs nothing measurable on the GET path (ON and OFF match;
-the small OFF dip is run-to-run noise). Absolute figures are lower than the
-table above because this client is **serial request/response**, bounded by
-per-request round-trip latency; the original generator batched more work per
-connection and hit ~278k. The stable signal remains the *relative*
-comparison (glibc vs musl, mimalloc on/off) — take any absolute number with
-the harness in mind.
+Readings and caveats:
+1. The engine is unchanged since the original numbers — doc-era and current
+   are statistically identical. The serial client saturates a server-side
+   per-request cost (auth verification + JSON + allocation) around ~155k
+   GET/s regardless of connection count — the transport wall, not the
+   storage engine.
+2. **Batching is the throughput lever**: the pipelined batch endpoint moves
+   the same per-request cost out of the per-op path (~100× on this
+   harness). This is a GET on one warm key; write batches show the same
+   shape.
+3. The relative signal (glibc vs musl, mimalloc on/off) remains the stable
+   comparison; absolute numbers depend on harness, CPU, and disk. Verify
+   with your own client against a minted L2 cap, not the L1 admin cap.

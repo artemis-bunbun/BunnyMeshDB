@@ -146,6 +146,24 @@ ok("by_index london -> p1", JSON.stringify(qlLon) === `["p1"]`);
 const qlPar = await db.ql(`by_index("city","paris")`);
 ok("by_index paris -> p2", JSON.stringify(qlPar) === `["p2"]`);
 
+// pipelined batch: one auth + one lock for put/get/del; per-op failures do
+// not abort; read-only caps are refused (write-gated like /ql).
+const batchR = await db.batch([
+  { op: "put", key: "b1", value: "batch-val" },
+  { op: "get", key: "b1" },
+  { op: "del", key: "b1" },
+  { op: "get", key: "b1" },
+]);
+ok("batch put ok", batchR[0].ok === true && typeof batchR[0].seq === "number", JSON.stringify(batchR[0]));
+ok("batch get returns value", batchR[1].ok === true && new TextDecoder().decode(batchR[1].value) === "batch-val", JSON.stringify(batchR[1]));
+ok("batch del ok", batchR[2].ok === true, JSON.stringify(batchR[2]));
+ok("batch get after del -> null", batchR[3].ok === true && batchR[3].value === null, JSON.stringify(batchR[3]));
+const mixed = await db.batch([{ op: "bogus", key: "x" }, { op: "get", key: "k1" }]);
+ok("batch per-op failure isolated", mixed[0].ok === false && mixed[1].ok === true, JSON.stringify(mixed));
+let roBatch403 = false;
+try { await ro.batch([{ op: "get", key: "k1" }]); } catch (e) { roBatch403 = e.status === 403; }
+ok("read-only cap batch -> 403", roBatch403);
+
 try { proc.kill("SIGKILL"); } catch {}
 // The SIGKILL below tears down the open SSE subscriptions; the reconnect
 // loop may reject with a transport error. Swallow + short-circuit so the

@@ -61,7 +61,13 @@ pub async fn build(addr: &str, tls: &Tls) -> Result<TlsListener, String> {
         .with_no_client_auth()
         .with_single_cert(cert_chain, key_der)
     {
-        Ok(c) => c,
+        Ok(mut c) => {
+            // Advertise HTTP/2 (and HTTP/1.1 fallback) so h2 clients get
+            // multiplexing over TLS; plaintext HTTP/1.1 remains the default
+            // when not using TLS (std axum serve negotiates h1).
+            c.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            c
+        }
         Err(e) => return Err(format!("tls: invalid cert/key for {}: {e}", tls.cert_path)),
     };
     let inner = match tokio::net::TcpListener::bind(addr).await {

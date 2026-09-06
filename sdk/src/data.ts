@@ -1,7 +1,7 @@
 import { BunnyMeshError, parseJson, request } from "./client.js";
 import { StreamUtf8 } from "./compat.js";
-import { b64Decode, decodeUtf8, utf8 } from "./encoding.js";
-import type { Change, ChangesResponse, ConflictEntry, Head, PutResult, ScanEntry, VersionInfo } from "./types.js";
+import { b64Decode, b64Encode, decodeUtf8, utf8 } from "./encoding.js";
+import type { BatchOp, BatchResult, Change, ChangesResponse, ConflictEntry, Head, PutResult, ScanEntry, VersionInfo } from "./types.js";
 
 /** Typed namespace client (L2 cap-authenticated, or L3 owner identity).
  *
@@ -229,5 +229,34 @@ export class DataClient {
   /** Run a query-DSL expression in this namespace. */
   async ql(expr: string): Promise<unknown> {
     return this.req("POST", "/ql", { json: { expr } }, DataClient.json);
+  }
+
+  /** Pipelined batch of data ops — the read/write throughput lever. One
+   * capability verification, one rate-limit charge, and one storage lock
+   * for the whole batch instead of per op. Ops apply in order to THIS
+   * namespace only (never cross-namespace), reads observe the consistent
+   * prefix of the batch, and a failing op is reported in place without
+   * aborting the batch. Requires a WRITE capability (like `ql`). Results
+   * align with `ops`. */
+  async batch(ops: BatchOp[]): Promise<BatchResult[]> {
+    const payload = ops.map((o) => {
+      if (o.op === "put") {
+        return { op: "put", key: o.key, value_b64: b64Encode(utf8(o.value)), ...(o.ttl ? { ttl: o.ttl } : {}) };
+      }
+      return { op: o.op, key: o.key };
+    });
+    const res = (await this.req("POST", "/batch", { json: { ops: payload } }, DataClient.json)) as {
+      results: Array<Record<string, unknown>>;
+    };
+    return res.results.map((r, i): BatchResult => {
+      const op = ops[i]!;
+      if (r.ok === true) {
+        if (op.op === "get") {
+          return { op: "get", ok: true, value: r.value_b64 != null ? b64Decode(String(r.value_b64)) : null };
+        }
+        return op.op === "put" ? { op: "put", ok: true, seq: r.seq as number } : { op: "del", ok: true };
+      }
+      return { op: op.op, ok: false, error: String(r.error ?? "error") };
+    });
   }
 }

@@ -115,6 +115,23 @@ Query-DSL expression. `{ "expr" }`. Functions:
   admin `/index` route (or `index_create`); values are JSON and the scalar
   field is extracted per value. Fields are only answerable once indexed.
 
+### `POST /{tier}/{ns}/batch`
+Pipelined batch (the throughput lever): one capability verification, one
+rate-limit charge, and one storage lock for the whole batch instead of per
+op. Body: `{ "ops": [ { op, key, ... } ] }`, `1..=1000` ops, all in this
+namespace only (never cross-namespace). Requires a **WRITE** capability on
+the namespace (like `/ql`) — read-only caps get `403`; the same part is
+charged once. Ops apply in order; reads observe the batch's consistent
+prefix; a failing op is reported in place and does not abort the batch (no
+rollback of earlier ops).
+- `{ "op":"get", "key" }` → `{ ok:true, value_b64 }` (standard base64; a
+  missing/expired key reads as `{ ok:true, value_b64:null }`)
+- `{ "op":"put", "key", "value_b64", "ttl"? }` → `{ ok:true, seq }`; quota
+  and JSON-Schema are enforced per op
+- `{ "op":"del", "key" }` → `{ ok:true }`
+- anything else → `{ ok:false, error }` aligned by index
+Response: `{ "results": [ ... ] }` aligned with `ops`.
+
 ## Rate limiting
 
 On by default: `node.ratelimit = { enabled, max_requests, window_secs }`

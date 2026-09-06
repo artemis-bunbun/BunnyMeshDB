@@ -84,3 +84,21 @@ export interface PutResult {
   seq: number;
   expires_at: number;
 }
+
+/** One op of a pipelined `DataClient.batch` call. Ops apply in order within
+ * the batch's namespace; `put` values are string-or-bytes, `ttl` in seconds. */
+export type BatchOp =
+  | { op: "put"; key: string; value: Uint8Array | string; ttl?: number }
+  | { op: "get"; key: string }
+  | { op: "del"; key: string };
+
+/** Result for one batch op, aligned with the input array. `get` decodes the
+ * value (`null` = missing/expired); a failed op reports `ok: false` and does
+ * not abort the batch. */
+export type BatchResult =
+  | { op: "put"; ok: true; seq: number }
+  | { op: "put"; ok: false; error: string }
+  | { op: "get"; ok: true; value: Uint8Array | null }
+  | { op: "get"; ok: false; error: string }
+  | { op: "del"; ok: true }
+  | { op: "del"; ok: false; error: string };

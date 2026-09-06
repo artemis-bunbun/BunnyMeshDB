@@ -44,6 +44,30 @@ export function b64urlEncode(data: Uint8Array): string {
   return out;
 }
 
+/** Standard-padded base64 encode (the server's `value_b64` wire flavor),
+ * working on Node, browsers, and RN. */
+export function b64Encode(data: Uint8Array): string {
+  if (hasBuffer()) return (Buffer as unknown as { from(b: Uint8Array): { toString(e: string): string } }).from(data).toString("base64");
+  if (hasBtoa()) {
+    let bin = "";
+    for (const b of data) bin += String.fromCharCode(b);
+    return btoa(bin);
+  }
+  // Pure JS fallback (RN etc.).
+  let out = "";
+  const n = data.length;
+  for (let i = 0; i < n; i += 3) {
+    const a = data[i];
+    const b = i + 1 < n ? data[i + 1] : undefined;
+    const c = i + 2 < n ? data[i + 2] : undefined;
+    out += B64[a >> 2];
+    out += B64[((a & 3) << 4) | (b !== undefined ? b >> 4 : 0)];
+    if (b !== undefined) out += B64[((b & 15) << 2) | (c !== undefined ? c >> 6 : 0)];
+    if (c !== undefined) out += B64[c & 63];
+  }
+  return out + "=".repeat((4 - (out.length % 4)) % 4);
+}
+
 /** Standard-base64 decode, tolerant of URL-safe chars + missing padding. */
 export function b64Decode(s: string): Uint8Array {
   const std = s.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");

@@ -3,11 +3,16 @@
  * are absent. */
 
 import type { Capability } from "./types.js";
-import { b64urlEncode as compatB64url, b64Decode as compatB64Decode, utf8Encode, utf8Decode } from "./compat.js";
+import { b64urlEncode as compatB64url, b64Encode as compatB64, b64Decode as compatB64Decode, utf8Encode, utf8Decode } from "./compat.js";
 
 /** URL-safe base64 (unpadded) — platform-agnostic. */
 export function b64urlEncode(data: Uint8Array): string {
   return compatB64url(data);
+}
+
+/** Standard-padded base64 (the server's `value_b64` wire format). */
+export function b64Encode(data: Uint8Array): string {
+  return compatB64(data);
 }
 
 /** Standard-base64 decode, tolerant of URL-safe characters + missing

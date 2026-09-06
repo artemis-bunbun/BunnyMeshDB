@@ -13,7 +13,7 @@ use crate::schema::{check_supported, validate_schema};
 use crate::server::ratelimit::RateLimiter;
 use crate::storage::{ConflictPolicy, Entry, StorageError, Store, Version};
 use crate::server::config::Config;
-use crate::util::{b64_encode, b64url_decode};
+use crate::util::{b64_decode, b64_encode, b64url_decode};
 use axum::extract::{Extension, Path, Query as AxumQuery, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
@@ -831,6 +831,163 @@ fn handle_scan(state: &AppState, caps: Option<&AuthCaps>, ns: &str, query: HashM
     Json(json!({ "entries": entries })).into_response()
 }
 
+/// POST /l2/{ns}/batch — pipelined batch of data ops in one request.
+///
+/// One WRITE authorization for the whole batch (exactly like `/ql`): every
+/// op applies to `ns` and can never cross namespaces, and a read-only
+/// capability cannot use batch. All ops execute under a single store lock:
+/// reads observe the consistent prefix of the batch, writes apply
+/// sequentially. Results are returned aligned by index; a failing op is
+/// reported in place and does not abort the batch (no rollback of earlier
+/// ops). Both the rate limiter and TLS/auth are paid once per batch, not per
+/// op — that is the pipelining win.
+async fn l2_batch(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(ns): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    handle_batch(&state, caps.as_ref(), &ns, &body)
+}
+
+/// POST /l3/u/{pk}/batch — L3-scoped batch (same semantics, namespace
+/// derived from the subject pk).
+async fn l3_batch(
+    State(state): State<AppState>,
+    Extension(caps): Extension<Option<AuthCaps>>,
+    Path(pk): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    handle_batch(&state, caps.as_ref(), &format!("u/{pk}"), &body)
+}
+
+fn handle_batch(state: &AppState, caps: Option<&AuthCaps>, ns: &str, body: &[u8]) -> Response {
+    const MAX_BATCH: usize = 1000;
+    let parsed: JValue = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return err_json(StatusCode::BAD_REQUEST, "bad_request"),
+    };
+    let ops = match parsed.get("ops").and_then(|o| o.as_array()) {
+        Some(a) => a,
+        None => return err_json(StatusCode::BAD_REQUEST, "missing_ops"),
+    };
+    if ops.is_empty() {
+        return err_json(StatusCode::BAD_REQUEST, "empty_batch");
+    }
+    if ops.len() > MAX_BATCH {
+        return err_json(StatusCode::BAD_REQUEST, "batch_too_large");
+    }
+    // One authorization for the whole batch; WRITE, like /ql.
+    let (principal, tier) = match data_auth(state, caps, ns, "", PermSet::WRITE) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let rid = state.root.to_bytes();
+    let pid = principal.to_bytes();
+    let mut results: Vec<JValue> = Vec::with_capacity(ops.len());
+    let mut mutated = false;
+    {
+        let mut store = state.store.write();
+        if tier == Tier::L3 {
+            if let Err(e) = ensure_l3_namespace(&mut store, &principal) {
+                return auth_to_response(e);
+            }
+        } else if store.policy(ns).is_none() {
+            return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
+        }
+        for op in ops {
+            let op_name = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
+            let key = match op.get("key").and_then(|k| k.as_str()) {
+                Some(k) => k.as_bytes().to_vec(),
+                None => {
+                    results.push(json!({ "ok": false, "error": "missing_key" }));
+                    continue;
+                }
+            };
+            match op_name {
+                "get" => {
+                    let now = now_ms();
+                    match store.get(ns, &key) {
+                        Some(e) => match latest_value(e, now) {
+                            Some(v) => results.push(json!({ "ok": true, "value_b64": b64_encode(&v) })),
+                            // Expired reads as absence (GET returns 404 for
+                            // both missing and expired).
+                            None => results.push(json!({ "ok": true, "value_b64": null })),
+                        },
+                        None => results.push(json!({ "ok": true, "value_b64": null })),
+                    }
+                }
+                "put" => {
+                    let value = match op.get("value_b64").and_then(|v| v.as_str()) {
+                        Some(v) => match b64_decode(v) {
+                            Ok(b) => b,
+                            Err(_) => {
+                                results.push(json!({ "ok": false, "error": "bad_value_b64" }));
+                                continue;
+                            }
+                        },
+                        None => {
+                            results.push(json!({ "ok": false, "error": "missing_value_b64" }));
+                            continue;
+                        }
+                    };
+                    if let Err(e) = account_write(&mut store, ns, value.len() as u64, state.default_quota) {
+                        results.push(json!({ "ok": false, "error": format!("{e}") }));
+                        continue;
+                    }
+                    if let Some(schema_bytes) = store.schema(ns) {
+                        let src = String::from_utf8_lossy(schema_bytes).into_owned();
+                        let schema = serde_json::from_str::<JValue>(&src).unwrap_or(JValue::Null);
+                        let payload = String::from_utf8_lossy(&value).into_owned();
+                        match serde_json::from_str::<JValue>(&payload) {
+                            Ok(v) => {
+                                if let Err(msg) = validate_schema(&schema, &v) {
+                                    results.push(json!({ "ok": false, "error": format!("schema_violation: {msg}") }));
+                                    continue;
+                                }
+                            }
+                            Err(_) => {
+                                results.push(json!({ "ok": false, "error": "schema_violation: value is not valid JSON" }));
+                                continue;
+                            }
+                        }
+                    }
+                    let expires_at = match op.get("ttl").and_then(|s| s.as_u64()) {
+                        Some(secs) if secs > 0 => now_ms() + secs * 1000,
+                        _ => 0,
+                    };
+                    let hlc = Hlc::now().to_u64();
+                    match store.put(ns, &key, &value, hlc, rid, pid, expires_at) {
+                        Ok(seq) => {
+                            state.metrics.bump_writes();
+                            mutated = true;
+                            results.push(json!({ "ok": true, "seq": seq }));
+                        }
+                        Err(e) => results.push(json!({ "ok": false, "error": format!("{e}") })),
+                    }
+                }
+                "del" => {
+                    let hlc = Hlc::now().to_u64();
+                    match store.delete(ns, &key, hlc, rid, pid) {
+                        Ok(_) => {
+                            state.metrics.bump_writes();
+                            mutated = true;
+                            results.push(json!({ "ok": true }));
+                        }
+                        Err(e) => results.push(json!({ "ok": false, "error": format!("{e}") })),
+                    }
+                }
+                _ => results.push(json!({ "ok": false, "error": "unknown_op" })),
+            }
+        }
+    }
+    if mutated {
+        state.notify_sync();
+        state.notify_change(ns);
+    }
+    Json(json!({ "results": results })).into_response()
+}
+
 fn handle_data(
     state: &AppState,
     caps: Option<&AuthCaps>,
@@ -1282,6 +1439,8 @@ pub fn app(state: AppState) -> Router {
         .route("/l3/u/{pk}/{*key}", get(l3_data).put(l3_data).delete(l3_data))
         .route("/l2/{ns}/ql", post(ql_l2))
         .route("/l3/u/{pk}/ql", post(ql_l3))
+        .route("/l2/{ns}/batch", post(l2_batch))
+        .route("/l3/u/{pk}/batch", post(l3_batch))
         .route("/l2/{ns}/head", get(l2_head))
         .route("/l2/{ns}/changes", get(l2_changes))
         .route("/l3/u/{pk}/head", get(l3_head))
