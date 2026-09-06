@@ -30,7 +30,7 @@ against the tool a developer would otherwise reach for.
 
 | Concern | bunnymeshdb | Crafted-for comparison (SQLite) |
 |---|---|---|
-| Throughput | ~240-278k GET/s single-node (mimalloc/musl) | SQLite similar order for reads, different workload |
+| Throughput | ~160-278k GET/s single-node, harness-dependent (see BENCHMARKS.md) | SQLite similar order for reads, different workload |
 | Concurrency model | Single-writer log append, snapshot index | Fine-grained queries, mature MVCC |
 | Query language | Indexed DSL (`by_index`/`scan` + `ql`), no JOIN | Full SQL |
 | Durability default | No per-record fsync (loss of last write on crash) unless `durable_writes` | Rollback journal / WAL, ACID |
@@ -76,6 +76,34 @@ against the tool a developer would otherwise reach for.
   host-scoped writes (not everyone-write CAS).
 - **Con:** not content-addressed for dedup; relies on pull (no DHT discovery);
   no swarm-wide global namespace (scoped per host).
+
+### vs. modern offline-first sync frameworks (Replicache, PowerSync, ElectricSQL, Zero)
+
+The trending competition for local-first apps (browser/mobile client ↔ your
+server) is a sync SDK + gateway that mirrors your Postgres down to a local
+SQLite with optimistic writes. Compared to them:
+
+- **Pro:** no client SDK/gateway topology to adopt — write a plain
+  `PUT /l2/<ns>/<key>` and it propagates via peer pull; no centralized sync
+  server (they all funnel through one); fewer moving parts; capabilities
+  instead of API keys. Works for N peer *devices* with no server at all.
+- **Con:** they serve a **client ↔ single-server** model with a real
+  relational engine underneath and change-data-capture tooling (watch a
+  Postgres table, replay to mobile); bunnymeshdb is a **handful of peer
+  nodes** doing KV with no relational query. If the product is inherently
+  client-server with relational needs, those frameworks are more mature and
+  more capable; if it's peer devices converging with no server, bunnymeshdb's
+  model is the match.
+
+### vs. CRDT document libraries (Automerge, Yjs, GUN.js)
+
+- **Pro:** bunnymeshdb is a durable, signed, revocable, capability-gated
+  **store** with persistence (snapshot + merkle log), HLC ordering, and
+  replication — these are in-memory/document merge layers (or, for GUN, a
+  JS-only decentralized graph with weaker auth).
+- **Con:** they merge at **field/document** granularity; bunnymeshdb's LWW /
+  whole-value register is coarser. For fine-grained concurrent editing, a
+  CRDT lib plus a sync layer wins.
 
 ## When to choose bunnymeshdb
 
