@@ -17,4 +17,4 @@ pub mod storage;
 
 /// Release version, kept in lockstep with `Cargo.toml [package] version`.
 /// Exposed for `--version` on the CLI and daemon binaries.
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.4.1";
