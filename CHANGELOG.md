@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Batched log records (ingest-side batching)
+- The batch endpoint (`/l2/{ns}/batch`, `/l3/u/{pk}/batch`) now writes
+  **ONE merkle-log record per request** (`TAG_BATCH`, carrying up to 1000
+  sub-ops) instead of N records. Log growth, replication payloads, snapshot
+  replay, and mesh transfer all drop up to 1000× for bulk writes. Verified
+  live: 1000-put batch → namespace head advances by exactly 1, all accepted
+  writes share one seq, 1000/1000 ops committed.
+- **Atomic batches**: one record = one dedupe identity, one change-feed/SSE
+  event, one visibility boundary. Reads inside a batch observe the
+  fully-applied batch (a get of a key a later op writes sees the final
+  state) — documented in API.md; the changes feed flags batch records with
+  `"batch": true` + `"ops"`.
+- Batches whose serialized record would exceed ~6 MiB are refused up front
+  (`413 batch_too_large`, nothing charged): a record that could not pass the
+  mesh replication frame budget would wedge that namespace's sync.
+- **Mesh replication fix**: a single log record larger than the 960 KiB
+  sync-chunk budget previously stalled that namespace's replication forever
+  (the chunk builder dropped it → empty chunk → infinite re-pull). The
+  builder now sends oversized records alone; verified live with a 1.2 MiB
+  value replicating node-to-node.
+- **Base64 decode fix**: `b64_decode` now tolerates standard `=` padding;
+  previously any padded base64 value (i.e. anything produced by a normal
+  ecosystem encoder) was rejected as an invalid char. Unpadded inputs still
+  decode.
+
 ## v0.3.0
 
 Performance pipeline: batching, HTTP/2, limiter striping.

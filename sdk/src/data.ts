@@ -232,12 +232,13 @@ export class DataClient {
   }
 
   /** Pipelined batch of data ops — the read/write throughput lever. One
-   * capability verification, one rate-limit charge, and one storage lock
-   * for the whole batch instead of per op. Ops apply in order to THIS
-   * namespace only (never cross-namespace), reads observe the consistent
-   * prefix of the batch, and a failing op is reported in place without
-   * aborting the batch. Requires a WRITE capability (like `ql`). Results
-   * align with `ops`. */
+   * capability verification, one rate-limit charge, one storage lock, and
+   * ONE log record for the whole batch instead of per op. Ops apply to this
+   * namespace only (never cross-namespace); the batch is atomic — reads
+   * inside it observe the fully-applied batch (a read of a key a later op
+   * writes sees the final state, not a position-dependent prefix); a
+   * failing op is reported in place without aborting the batch. Requires a
+   * WRITE capability (like `ql`). Results align with `ops`. */
   async batch(ops: BatchOp[]): Promise<BatchResult[]> {
     const payload = ops.map((o) => {
       if (o.op === "put") {

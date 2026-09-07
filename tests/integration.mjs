@@ -146,8 +146,11 @@ ok("by_index london -> p1", JSON.stringify(qlLon) === `["p1"]`);
 const qlPar = await db.ql(`by_index("city","paris")`);
 ok("by_index paris -> p2", JSON.stringify(qlPar) === `["p2"]`);
 
-// pipelined batch: one auth + one lock for put/get/del; per-op failures do
-// not abort; read-only caps are refused (write-gated like /ql).
+// pipelined batch: one auth + one rate-limit + ONE log record. The batch is
+// atomic: reads inside the batch observe the fully-applied batch — a get of
+// a key that a LATER op in the same batch writes sees the final state, not a
+// positional prefix. Per-op failures do not abort; read-only caps are
+// refused (write-gated like /ql).
 const batchR = await db.batch([
   { op: "put", key: "b1", value: "batch-val" },
   { op: "get", key: "b1" },
@@ -155,9 +158,18 @@ const batchR = await db.batch([
   { op: "get", key: "b1" },
 ]);
 ok("batch put ok", batchR[0].ok === true && typeof batchR[0].seq === "number", JSON.stringify(batchR[0]));
-ok("batch get returns value", batchR[1].ok === true && new TextDecoder().decode(batchR[1].value) === "batch-val", JSON.stringify(batchR[1]));
+// b1 is written then DELETED by the same batch: the batch is one record, so
+// BOTH reads see the final state (deleted → null).
+ok("batch get sees fully-applied batch (del shadows put)", batchR[1].ok === true && batchR[1].value === null, JSON.stringify(batchR[1]));
 ok("batch del ok", batchR[2].ok === true, JSON.stringify(batchR[2]));
 ok("batch get after del -> null", batchR[3].ok === true && batchR[3].value === null, JSON.stringify(batchR[3]));
+// A read of a key the batch does not write sees pre-batch state.
+const batchR2 = await db.batch([{ op: "put", key: "b2", value: "v2" }, { op: "get", key: "b1" }]);
+ok("batch read of untouched key -> null", batchR2[1].ok === true && batchR2[1].value === null, JSON.stringify(batchR2));
+// All accepted writes in one batch share the batch record's seq (ONE log
+// record); two puts expose it through the typed SDK.
+const shareSeq = await db.batch([{ op: "put", key: "s1", value: "x" }, { op: "put", key: "s2", value: "y" }]);
+ok("batch accepted writes share one log seq", shareSeq[0].ok === true && shareSeq[1].ok === true && shareSeq[0].seq === shareSeq[1].seq, JSON.stringify(shareSeq));
 const mixed = await db.batch([{ op: "bogus", key: "x" }, { op: "get", key: "k1" }]);
 ok("batch per-op failure isolated", mixed[0].ok === false && mixed[1].ok === true, JSON.stringify(mixed));
 let roBatch403 = false;

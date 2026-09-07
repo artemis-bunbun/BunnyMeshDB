@@ -90,8 +90,12 @@ Scan keys under a byte prefix → `{ "entries": [ { "key", "value_b64",
 Gapless, lowest-seq-first stream of durable records:
 ```json
 { "since", "head": { "seq", "hash" }, "changes": [ { "seq", "key_b64",
-"value_b64", "del", "ttl", "expires_at", "hlc" } ] }
+"value_b64", "del", "ttl", "expires_at", "hlc", "batch", "ops" } ] }
 ```
+A batch write appears as **one** change (it is one record): `"batch": true`
+and `"ops"` = its sub-op count; `key_b64`/`value_b64` are empty for it. The
+SSE events API (`/events?since=<seq>`) likewise emits one `change` event
+per batch record.
 
 ### `GET /{tier}/{ns}/events?since=<seq>` (SSE)
 Server-Sent Events change push with resume. Replays every record after
@@ -117,19 +121,29 @@ Query-DSL expression. `{ "expr" }`. Functions:
 
 ### `POST /{tier}/{ns}/batch`
 Pipelined batch (the throughput lever): one capability verification, one
-rate-limit charge, and one storage lock for the whole batch instead of per
-op. Body: `{ "ops": [ { op, key, ... } ] }`, `1..=1000` ops, all in this
-namespace only (never cross-namespace). Requires a **WRITE** capability on
-the namespace (like `/ql`) — read-only caps get `403`; the same part is
-charged once. Ops apply in order; reads observe the batch's consistent
-prefix; a failing op is reported in place and does not abort the batch (no
-rollback of earlier ops).
+rate-limit charge, one storage lock, and **one log record** for the whole
+batch instead of per op. Body: `{ "ops": [ { op, key, ... } ] }`,
+`1..=1000` ops, all in this namespace only (never cross-namespace).
+Requires a **WRITE** capability on the namespace (like `/ql`) — read-only
+caps get `403`; the same part is charged once.
+
+The batch is **atomic**: it is appended as a single merkle-log record, so it
+has one dedupe identity, one change-feed/SSE event, and one visibility
+boundary — reads inside the batch observe the **fully-applied batch** (a
+`get` of a key that a later op in the same batch writes sees the final
+state, not a position-dependent prefix). A failing op is reported in place
+and does not abort the batch (no rollback of earlier ops).
 - `{ "op":"get", "key" }` → `{ ok:true, value_b64 }` (standard base64; a
   missing/expired key reads as `{ ok:true, value_b64:null }`)
 - `{ "op":"put", "key", "value_b64", "ttl"? }` → `{ ok:true, seq }`; quota
   and JSON-Schema are enforced per op
 - `{ "op":"del", "key" }` → `{ ok:true }`
 - anything else → `{ ok:false, error }` aligned by index
+
+All accepted writes share the batch record's `seq` (all sub-ops are one
+record). If the serialized batch record would exceed ~6 MiB the request is
+refused with `413 batch_too_large` before anything is charged (a record
+beyond the replication frame budget could not reach mesh peers).
 Response: `{ "results": [ ... ] }` aligned with `ops`.
 
 ## Rate limiting

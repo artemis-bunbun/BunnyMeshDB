@@ -43,6 +43,14 @@ pub const TAG_SCHEMA: u8 = 0x04;
 /// same secondary index from the same values (the index itself is derived,
 /// never stored — only this definition replicates).
 pub const TAG_INDEX: u8 = 0x05;
+/// A batch of PUT/PUT_TTL/DEL ops written as ONE record — one chain link,
+/// one dedupe identity, one atomic apply. Payload: `count:u32` followed by
+/// `count` sub-op payloads (each is a standalone record's payload section
+/// preceded by its own tag byte; sub-ops are never themselves batches). The
+/// outer record's key/value are empty; its hlc/replica/author mirror the
+/// FIRST sub-op, which makes the dedupe key `(TAG_BATCH, hlc, replica)`
+/// unique per node (the node HLC is strictly increasing).
+pub const TAG_BATCH: u8 = 0x06;
 /// 64 MiB segment roll threshold.
 pub const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -68,33 +76,57 @@ pub struct Record {
     pub value: Vec<u8>,
     /// Wall-clock expiry ms for TAG_PUT_TTL; 0 = never. Always 0 for PUT/DEL.
     pub expires_at: u64,
+    /// Sub-ops for TAG_BATCH (payload order); empty for all other tags.
+    pub ops: Vec<Record>,
 }
 
 impl Record {
     /// Serialize with `prev` filled in; returns the full record bytes.
     pub fn to_bytes(&self, prev: [u8; 32]) -> Vec<u8> {
-        let key_len = self.key.len() as u32;
-        let val_len = self.value.len() as u64;
-        let ttl = if self.tag == TAG_PUT_TTL { 8 } else { 0 };
-        let payload_len = 4 + key_len as usize + 8 + 32 + 32 + 8 + val_len as usize + ttl;
-        let mut out = Vec::with_capacity(HEADER_LEN + payload_len);
+        // A batch record's payload is count:u32 then each sub-op's own tag
+        // byte + payload section; everything else is the standalone payload.
+        let payload = if self.tag == TAG_BATCH {
+            let mut p = Vec::with_capacity(4);
+            p.extend_from_slice(&(self.ops.len() as u32).to_le_bytes());
+            for op in &self.ops {
+                p.push(op.tag);
+                p.extend_from_slice(&Self::payload_bytes(op));
+            }
+            p
+        } else {
+            Self::payload_bytes(self)
+        };
+        let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
         out.push(self.tag);
-        out.extend_from_slice(&(payload_len as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         // crc placeholder, filled below
         out.extend_from_slice(&[0u8; 4]);
         out.extend_from_slice(&prev);
-        out.extend_from_slice(&key_len.to_le_bytes());
-        out.extend_from_slice(&self.key);
-        out.extend_from_slice(&self.hlc.to_le_bytes());
-        out.extend_from_slice(&self.replica);
-        out.extend_from_slice(&self.author);
-        out.extend_from_slice(&val_len.to_le_bytes());
-        out.extend_from_slice(&self.value);
-        if ttl != 0 {
-            out.extend_from_slice(&self.expires_at.to_le_bytes());
-        }
+        out.extend_from_slice(&payload);
         let crc = crc32_parts(&out[..1], &out[9..]);
         out[5..9].copy_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// A standalone record's payload section: key_len | key | hlc |
+    /// replica | author | val_len | value, plus a trailing expires_at:u64
+    /// for TAG_PUT_TTL (0 = never). Identical bytes to the pre-batch
+    /// serialization, so old logs still parse and new sub-ops reuse it.
+    fn payload_bytes(r: &Record) -> Vec<u8> {
+        let key_len = r.key.len() as u32;
+        let val_len = r.value.len() as u64;
+        let ttl = if r.tag == TAG_PUT_TTL { 8 } else { 0 };
+        let mut out = Vec::with_capacity(4 + key_len as usize + 8 + 32 + 32 + 8 + val_len as usize + ttl);
+        out.extend_from_slice(&key_len.to_le_bytes());
+        out.extend_from_slice(&r.key);
+        out.extend_from_slice(&r.hlc.to_le_bytes());
+        out.extend_from_slice(&r.replica);
+        out.extend_from_slice(&r.author);
+        out.extend_from_slice(&val_len.to_le_bytes());
+        out.extend_from_slice(&r.value);
+        if ttl != 0 {
+            out.extend_from_slice(&r.expires_at.to_le_bytes());
+        }
         out
     }
 
@@ -116,7 +148,7 @@ impl Record {
             return Err(StorageError::Corrupt { ns: None, detail: "record shorter than header".into() });
         }
         let tag = bytes[0];
-        if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL && tag != TAG_SCHEMA && tag != TAG_INDEX {
+        if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL && tag != TAG_SCHEMA && tag != TAG_INDEX && tag != TAG_BATCH {
             return Err(StorageError::Corrupt { ns: None, detail: format!("bad record tag {tag:#x}") });
         }
         let declared_len = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
@@ -142,6 +174,58 @@ impl Record {
             }
         }
         let mut p = HEADER_LEN;
+        let (record, _end) = if tag == TAG_BATCH {
+            // count:u32 then the sub-ops (tag byte + payload section each).
+            if p + 4 > bytes.len() {
+                return Err(StorageError::Corrupt { ns: None, detail: "batch count overruns".into() });
+            }
+            let count = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
+            p += 4;
+            let mut ops: Vec<Record> = Vec::with_capacity(count);
+            for _ in 0..count {
+                if p >= bytes.len() {
+                    return Err(StorageError::Corrupt { ns: None, detail: "batch sub-op overruns".into() });
+                }
+                let sub_tag = bytes[p];
+                if sub_tag != TAG_PUT && sub_tag != TAG_PUT_TTL && sub_tag != TAG_DEL {
+                    return Err(StorageError::Corrupt { ns: None, detail: format!("bad batch sub-op tag {sub_tag:#x}") });
+                }
+                let (sub, np) = Self::parse_payload(sub_tag, bytes, p + 1)?;
+                p = np;
+                ops.push(sub);
+            }
+            // Mirror the first sub-op so the dedupe key
+            // (TAG_BATCH, hlc, replica) matches what put_batch wrote.
+            let (b_hlc, b_replica, b_author) = if ops.is_empty() {
+                (0u64, [0u8; 32], [0u8; 32])
+            } else {
+                (ops[0].hlc, ops[0].replica, ops[0].author)
+            };
+            let rec = Record {
+                tag: TAG_BATCH,
+                key: Vec::new(),
+                hlc: b_hlc,
+                replica: b_replica,
+                author: b_author,
+                value: Vec::new(),
+                expires_at: 0,
+                ops,
+            };
+            Ok((rec, p))
+        } else {
+            Self::parse_payload(tag, bytes, p)
+        }?;
+        Ok((record, prev))
+    }
+
+    /// Parse a standalone record's payload section at offset `p` (bounds and
+    /// lengths verified); returns the record (sub-ops empty) and the new
+    /// offset. Shared by standalone records and batch sub-ops.
+    fn parse_payload(tag: u8, bytes: &[u8], p: usize) -> Result<(Record, usize), StorageError> {
+        let mut p = p;
+        if p + 4 > bytes.len() {
+            return Err(StorageError::Corrupt { ns: None, detail: "key_len overruns".into() });
+        }
         let key_len = u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()) as usize;
         p += 4;
         if key_len > bytes.len().saturating_sub(p) {
@@ -174,11 +258,15 @@ impl Record {
             if p + 8 > bytes.len() {
                 return Err(StorageError::Corrupt { ns: None, detail: "expires_at overruns".into() });
             }
-            u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap())
+            let exp = u64::from_le_bytes(bytes[p..p + 8].try_into().unwrap());
+            // Advance past the TTL: for a standalone record nothing follows,
+            // but a batch sub-op's TTL is followed by the next sub-op.
+            p += 8;
+            exp
         } else {
             0
         };
-        Ok((Record { tag, key, hlc, replica, author, value, expires_at }, prev))
+        Ok((Record { tag, key, hlc, replica, author, value, expires_at, ops: Vec::new() }, p))
     }
 
     /// sha256(prev || full_record_bytes) — the chain link.
@@ -321,7 +409,7 @@ impl Log {
                     break 'segments;
                 }
                 let tag = buf[pos];
-                if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL && tag != TAG_SCHEMA && tag != TAG_INDEX {
+                if tag != TAG_PUT && tag != TAG_DEL && tag != TAG_PUT_TTL && tag != TAG_SCHEMA && tag != TAG_INDEX && tag != TAG_BATCH {
                     // A bad tag is never a clean torn write end; refuse.
                     return Err(StorageError::Corrupt {
                         ns: Some(ns_from_dir(dir)),
@@ -550,6 +638,7 @@ mod tests {
             author: [9u8; 32],
             value: value.to_vec(),
             expires_at: 0,
+            ops: Vec::new(),
         }
     }
 
@@ -754,5 +843,80 @@ mod tests {
         assert_eq!(warn, None, "no corruption after roll");
         assert_eq!(log2.seq(), 68);
         assert_eq!(log2.read_records(1, 0).unwrap().len(), 68);
+    }
+
+    #[test]
+    fn batch_record_roundtrip_chains_and_parses() {
+        let dir = tmpdir("batch");
+        let nd = ns_dir(&dir, "ns");
+        let mut log = Log::open(&dir, "ns").unwrap();
+        // One standalone PUT, then one batch of put/put_ttl/del.
+        let r0 = rec(TAG_PUT, b"warm", 1, b"up");
+        let s0 = log.append(&r0.to_bytes([0u8; 32])).unwrap();
+        assert_eq!(s0, 1);
+        let sub1 = rec(TAG_PUT, b"a", 10, b"av1");
+        let sub2 = rec(TAG_PUT_TTL, b"t", 11, b"temp");
+        let sub3 = rec(TAG_DEL, b"gone", 12, b"");
+        let batch = Record {
+            tag: TAG_BATCH,
+            key: Vec::new(),
+            hlc: sub1.hlc,
+            replica: sub1.replica,
+            author: sub1.author,
+            value: Vec::new(),
+            expires_at: 0,
+            ops: vec![sub1, sub2, sub3],
+        };
+        let s1 = log.append(&batch.to_bytes(Record::record_hash(&[0u8; 32], &r0.to_bytes([0u8; 32])))).unwrap();
+        assert_eq!(s1, 2, "batch is ONE record (seq advances by one)");
+        drop(log);
+        let (log2, warn) = Log::recover(&nd).unwrap();
+        assert_eq!(warn, None);
+        assert_eq!(log2.seq(), 2);
+        let recs = log2.read_records(1, 0).unwrap();
+        assert_eq!(recs.len(), 2, "two records total: warmup + batch");
+        let (_, bytes) = &recs[1];
+        let (parsed, _) = Record::parse_chain(&bytes, None).unwrap();
+        assert_eq!(parsed.tag, TAG_BATCH);
+        assert_eq!(parsed.hlc, 10, "outer hlc mirrors first sub-op");
+        assert_eq!(parsed.ops.len(), 3);
+        assert_eq!(parsed.ops[0].tag, TAG_PUT);
+        assert_eq!(parsed.ops[0].key, b"a".to_vec());
+        assert_eq!(parsed.ops[0].value, b"av1".to_vec());
+        assert_eq!(parsed.ops[1].tag, TAG_PUT_TTL);
+        assert_eq!(parsed.ops[1].expires_at, 0u64, "TTL sub-op with expires 0 (helper sets none)");
+        assert_eq!(parsed.ops[2].tag, TAG_DEL);
+        assert_eq!(parsed.ops[2].value, b"".to_vec());
+        // Chain continues through the batch record: a PUT appended after the
+        // batch must parse against the batch's chain link as the running head.
+        let h_warmup = Record::record_hash(&[0u8; 32], &recs[0].1);
+        let r3 = rec(TAG_PUT, b"after", 13, b"v");
+        let b3 = r3.to_bytes(h_warmup);
+        let (parsed3, _) = Record::parse_chain(&b3, Some(&h_warmup)).unwrap();
+        assert_eq!(parsed3.key, b"after".to_vec(), "record after batch chains onto the batch hash");
+    }
+
+    #[test]
+    fn batch_record_rejects_bad_sub_ops() {
+        // A batch payload with an invalid sub-op tag must fail parse with
+        // Corrupt (never a clean truncation decision).
+        let sub = rec(TAG_PUT, b"k", 5, b"v");
+        let sub_payload = sub.to_bytes([0u8; 32]);
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(0xEE); // invalid sub-op tag
+        payload.extend_from_slice(&sub_payload[41..]);
+        let mut rec_bytes: Vec<u8> = Vec::new();
+        rec_bytes.push(TAG_BATCH);
+        rec_bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        rec_bytes.extend_from_slice(&[0u8; 4]);
+        rec_bytes.extend_from_slice(&[0u8; 32]);
+        rec_bytes.extend_from_slice(&payload);
+        let crc = crc32_parts(&rec_bytes[..1], &rec_bytes[9..]);
+        rec_bytes[5..9].copy_from_slice(&crc.to_le_bytes());
+        match Record::parse_chain(&rec_bytes, Some(&[0u8; 32])) {
+            Err(StorageError::Corrupt { .. }) => {}
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
     }
 }

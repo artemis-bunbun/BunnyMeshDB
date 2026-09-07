@@ -35,7 +35,7 @@ worker_threads = 2
 mesh_sync = true
 sync_interval_secs = ${SYNC_SECS}
 [node.l3]
-default_quota = 1048576
+default_quota = 10485760
 [[peers]]
 name = "${peerName}"
 addr = "/ip4/127.0.0.1/tcp/${peerP2p}"
@@ -122,6 +122,32 @@ await eventually(
   30000,
 );
 ok("mesh: index def + by_index converge on B", true);
+
+// batch writes replicate as ONE atomic log record through the mesh: B pulls
+// a TAG_BATCH record and applies every sub-op as a unit.
+const batchOps = [];
+for (let i = 0; i < 25; i++) batchOps.push({ op: "put", key: `bk${i}`, value: `bulk-${i}` });
+const batchRes = await dbA.batch(batchOps);
+ok("mesh: batch on A committed", batchRes.every((r) => r.ok === true));
+await eventually(
+  () => Promise.all(batchOps.map((o) => dbB.getText(o.key))).then((vs) => vs.every((v, i) => v === `bulk-${i}`)),
+  `B converges on A's batch record`,
+  30000,
+);
+ok("mesh: B converges on A's batch record", true);
+
+// A single record LARGER than the mesh chunk budget (960 KiB) must still
+// replicate: the pull builder sends it alone rather than dropping it (an
+// empty chunk used to make the puller re-pull forever from the same seq).
+const BIG = 1_200_000;
+const bigVal = "y".repeat(BIG);
+await dbA.put("big", bigVal);
+await eventually(
+  () => dbB.getText("big").then((v) => v !== null && v.length === BIG),
+  `B converges on oversized record (>960KiB)`,
+  90000,
+);
+ok("mesh: oversized record (>960KiB) replicates", true);
 
 // Mesh sync is already proven behaviorally: B converging on A's writes
 // (above) is only possible via a working libp2p pull — there is no other

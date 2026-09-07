@@ -1,6 +1,7 @@
-//! Hand-rolled base64 / base64url (standard alphabets, no padding).
-//! Encoding only — signatures are verified before any base64 decode is
-//! trusted, so this is not a security boundary.
+//! Hand-rolled base64 / base64url (standard alphabets; encoding is uniform,
+//! decoding tolerates standard '=' padding). Encoding only — signatures are
+//! verified before any base64 decode is trusted, so this is not a security
+//! boundary.
 
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -29,15 +30,28 @@ fn decode_impl(s: &str, alpha: &[u8; 64]) -> Result<Vec<u8>, String> {
     for (i, &c) in alpha.iter().enumerate() {
         rev[c as usize] = i as u8;
     }
-    let valid: Vec<u8> = s
-        .bytes()
+    // Standard base64 pads to a multiple of 4 with '='. Tolerate up to two
+    // trailing '=' (every ecosystem encoder emits them); reject '=' anywhere
+    // else. Encoding here emits no padding, so both forms decode.
+    let mut src: Vec<u8> = s.bytes().collect::<Vec<u8>>();
+    let mut pad = 0usize;
+    while pad < 2 && !src.is_empty() && src[src.len() - 1] == b'=' {
+        src.pop();
+        pad += 1;
+    }
+    if src.contains(&b'=') {
+        return Err("invalid base64 padding".into());
+    }
+    let valid: Vec<u8> = src
+        .iter()
         .map(|b| {
-            if b >= 128 {
-                Err(format!("non-ascii byte {b}"))
-            } else if rev[b as usize] == 255 {
-                Err(format!("invalid base64 char {:?}", b as char))
+            let b8 = *b;
+            if b8 >= 128 {
+                Err(format!("non-ascii byte {b8}"))
+            } else if rev[b8 as usize] == 255 {
+                Err(format!("invalid base64 char {:?}", b8 as char))
             } else {
-                Ok(rev[b as usize])
+                Ok(rev[b8 as usize])
             }
         })
         .collect::<Result<_, _>>()?;

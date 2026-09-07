@@ -863,6 +863,10 @@ async fn l3_batch(
 
 fn handle_batch(state: &AppState, caps: Option<&AuthCaps>, ns: &str, body: &[u8]) -> Response {
     const MAX_BATCH: usize = 1000;
+    /// The serialized batch record cap. One HTTP batch = one log record, and
+    /// replication frames allow ~7 MiB binary after base64+JSON envelope
+    /// (codec response cap 10 MiB), so 6 MiB keeps every batch replicable.
+    const MAX_BATCH_RECORD_BYTES: u64 = 6 * 1024 * 1024;
     let parsed: JValue = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return err_json(StatusCode::BAD_REQUEST, "bad_request"),
@@ -884,7 +888,18 @@ fn handle_batch(state: &AppState, caps: Option<&AuthCaps>, ns: &str, body: &[u8]
     };
     let rid = state.root.to_bytes();
     let pid = principal.to_bytes();
-    let mut results: Vec<JValue> = Vec::with_capacity(ops.len());
+    // Per-op outcomes, aligned with the input ops; slots fill as they resolve.
+    let mut results: Vec<Option<JValue>> = Vec::with_capacity(ops.len());
+    // Accepted write sub-ops, applied at the end as ONE atomic batch record;
+    // deferred gets read the store AFTER the batch is applied, so every read
+    // inside the batch observes the fully-applied batch (a batch is one log
+    // record: one visibility boundary, one dedupe identity, one change
+    // event). Reads of keys that later batch ops write therefore see the
+    // final batch state, not an intermediate prefix.
+    let mut accepted: Vec<crate::storage::log::Record> = Vec::with_capacity(ops.len());
+    // Result index → deferred get key / accepted write result index.
+    let mut pending_gets: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut pending_writes: Vec<usize> = Vec::new();
     let mut mutated = false;
     {
         let mut store = state.store.write();
@@ -895,44 +910,69 @@ fn handle_batch(state: &AppState, caps: Option<&AuthCaps>, ns: &str, body: &[u8]
         } else if store.policy(ns).is_none() {
             return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
         }
+        // ---- Pass 0: serialized-record size preflight (b64 lengths, no
+        // decode — a decoded size never exceeds this bound) ----
+        // The whole batch becomes ONE log record, so bound it before any
+        // quota is charged or bytes appended: a record that could not pass
+        // through the mesh replication frame budget would wedge that
+        // namespace's sync, so refuse it up front instead.
+        let mut est = 0u64;
+        for op in ops {
+            let op_name = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
+            let key_len = match op.get("key").and_then(|k| k.as_str()) {
+                Some(k) => k.len() as u64,
+                None => 0,
+            };
+            match op_name {
+                "put" => {
+                    // sub-tag(1) + key_len(4) + key + hlc(8) + replica(32) +
+                    // author(32) + val_len(8) + value + ttl(8).
+                    let val_bound = match op.get("value_b64").and_then(|v| v.as_str()) {
+                        Some(s) => ((s.len() as u64 + 3) / 4) * 3,
+                        None => 0,
+                    };
+                    est += 93 + key_len + val_bound;
+                }
+                "del" => {
+                    est += 85 + key_len;
+                }
+                _ => {}
+            }
+        }
+        if est > MAX_BATCH_RECORD_BYTES {
+            return err_json(StatusCode::PAYLOAD_TOO_LARGE, "batch_too_large");
+        }
+        // ---- Pass 1: validate every op, collecting accepted writes ----
         for op in ops {
             let op_name = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
             let key = match op.get("key").and_then(|k| k.as_str()) {
                 Some(k) => k.as_bytes().to_vec(),
                 None => {
-                    results.push(json!({ "ok": false, "error": "missing_key" }));
+                    results.push(Some(json!({ "ok": false, "error": "missing_key" })));
                     continue;
                 }
             };
             match op_name {
                 "get" => {
-                    let now = now_ms();
-                    match store.get(ns, &key) {
-                        Some(e) => match latest_value(e, now) {
-                            Some(v) => results.push(json!({ "ok": true, "value_b64": b64_encode(&v) })),
-                            // Expired reads as absence (GET returns 404 for
-                            // both missing and expired).
-                            None => results.push(json!({ "ok": true, "value_b64": null })),
-                        },
-                        None => results.push(json!({ "ok": true, "value_b64": null })),
-                    }
+                    pending_gets.push((results.len(), key));
+                    results.push(None);
                 }
                 "put" => {
                     let value = match op.get("value_b64").and_then(|v| v.as_str()) {
                         Some(v) => match b64_decode(v) {
                             Ok(b) => b,
                             Err(_) => {
-                                results.push(json!({ "ok": false, "error": "bad_value_b64" }));
+                                results.push(Some(json!({ "ok": false, "error": "bad_value_b64" })));
                                 continue;
                             }
                         },
                         None => {
-                            results.push(json!({ "ok": false, "error": "missing_value_b64" }));
+                            results.push(Some(json!({ "ok": false, "error": "missing_value_b64" })));
                             continue;
                         }
                     };
                     if let Err(e) = account_write(&mut store, ns, value.len() as u64, state.default_quota) {
-                        results.push(json!({ "ok": false, "error": format!("{e}") }));
+                        results.push(Some(json!({ "ok": false, "error": format!("{e}") })));
                         continue;
                     }
                     if let Some(schema_bytes) = store.schema(ns) {
@@ -942,12 +982,12 @@ fn handle_batch(state: &AppState, caps: Option<&AuthCaps>, ns: &str, body: &[u8]
                         match serde_json::from_str::<JValue>(&payload) {
                             Ok(v) => {
                                 if let Err(msg) = validate_schema(&schema, &v) {
-                                    results.push(json!({ "ok": false, "error": format!("schema_violation: {msg}") }));
+                                    results.push(Some(json!({ "ok": false, "error": format!("schema_violation: {msg}") })));
                                     continue;
                                 }
                             }
                             Err(_) => {
-                                results.push(json!({ "ok": false, "error": "schema_violation: value is not valid JSON" }));
+                                results.push(Some(json!({ "ok": false, "error": "schema_violation: value is not valid JSON" })));
                                 continue;
                             }
                         }
@@ -957,35 +997,86 @@ fn handle_batch(state: &AppState, caps: Option<&AuthCaps>, ns: &str, body: &[u8]
                         _ => 0,
                     };
                     let hlc = Hlc::now().to_u64();
-                    match store.put(ns, &key, &value, hlc, rid, pid, expires_at) {
-                        Ok(seq) => {
-                            state.metrics.bump_writes();
-                            mutated = true;
-                            results.push(json!({ "ok": true, "seq": seq }));
-                        }
-                        Err(e) => results.push(json!({ "ok": false, "error": format!("{e}") })),
-                    }
+                    accepted.push(crate::storage::log::Record {
+                        tag: if expires_at == 0 { crate::storage::log::TAG_PUT } else { crate::storage::log::TAG_PUT_TTL },
+                        key,
+                        hlc,
+                        replica: rid,
+                        author: pid,
+                        value,
+                        expires_at,
+                        ops: Vec::new(),
+                    });
+                    pending_writes.push(results.len());
+                    results.push(None);
                 }
                 "del" => {
                     let hlc = Hlc::now().to_u64();
-                    match store.delete(ns, &key, hlc, rid, pid) {
-                        Ok(_) => {
-                            state.metrics.bump_writes();
-                            mutated = true;
-                            results.push(json!({ "ok": true }));
-                        }
-                        Err(e) => results.push(json!({ "ok": false, "error": format!("{e}") })),
+                    accepted.push(crate::storage::log::Record {
+                        tag: crate::storage::log::TAG_DEL,
+                        key,
+                        hlc,
+                        replica: rid,
+                        author: pid,
+                        value: Vec::new(),
+                        expires_at: 0,
+                        ops: Vec::new(),
+                    });
+                    pending_writes.push(results.len());
+                    results.push(None);
+                }
+                _ => results.push(Some(json!({ "ok": false, "error": "unknown_op" }))),
+            }
+        }
+        // ---- Apply: ONE record for the whole batch ----
+        let mut batch_seq = 0u64;
+        if !accepted.is_empty() {
+            match store.put_batch(ns, &accepted) {
+                Ok(seq) => {
+                    batch_seq = seq;
+                    for _ in &pending_writes {
+                        state.metrics.bump_writes();
+                    }
+                    mutated = true;
+                }
+                Err(e) => {
+                    // Append failed: report every accepted write in place.
+                    for i in &pending_writes {
+                        results[*i] = Some(json!({ "ok": false, "error": format!("{e}") }));
                     }
                 }
-                _ => results.push(json!({ "ok": false, "error": "unknown_op" })),
             }
+        }
+        // ---- Resolve deferred gets against the fully-applied batch ----
+        let now = now_ms();
+        for (i, key) in pending_gets {
+            match store.get(ns, &key) {
+                Some(e) => match latest_value(e, now) {
+                    Some(v) => results[i] = Some(json!({ "ok": true, "value_b64": b64_encode(&v) })),
+                    // Expired reads as absence (GET returns 404 for both
+                    // missing and expired).
+                    None => results[i] = Some(json!({ "ok": true, "value_b64": null })),
+                },
+                None => results[i] = Some(json!({ "ok": true, "value_b64": null })),
+            }
+        }
+        // ---- Resolve accepted writes (all share the batch record's seq) ----
+        for i in &pending_writes {
+            results[*i] = Some(json!({ "ok": true, "seq": batch_seq }));
         }
     }
     if mutated {
         state.notify_sync();
         state.notify_change(ns);
     }
-    Json(json!({ "results": results })).into_response()
+    let out: Vec<JValue> = results
+        .iter()
+        .map(|r| match r {
+            Some(v) => v.clone(),
+            None => JValue::Null,
+        })
+        .collect();
+    Json(json!({ "results": out })).into_response()
 }
 
 fn handle_data(
@@ -1220,6 +1311,10 @@ async fn l2_changes(
                         "ttl": rec.expires_at != 0,
                         "expires_at": rec.expires_at,
                         "hlc": rec.hlc,
+                        // A batch record is one atomic write of N ops; the
+                        // feed shows it as one change with its op count.
+                        "batch": rec.tag == crate::storage::log::TAG_BATCH,
+                        "ops": rec.ops.len() as u64,
                     }),
                     Err(_) => json!({ "seq": seq, "parse_error": true }),
                 }
@@ -1278,6 +1373,10 @@ async fn l3_changes(
                         "ttl": rec.expires_at != 0,
                         "expires_at": rec.expires_at,
                         "hlc": rec.hlc,
+                        // A batch record is one atomic write of N ops; the
+                        // feed shows it as one change with its op count.
+                        "batch": rec.tag == crate::storage::log::TAG_BATCH,
+                        "ops": rec.ops.len() as u64,
                     }),
                     Err(_) => json!({ "seq": seq, "parse_error": true }),
                 }
@@ -1400,7 +1499,7 @@ fn sse_events(state: AppState, ns: String, since: u64) -> Response {
                 let bytes = first_bytes.unwrap();
                 let (_, prev) = match crate::storage::log::Record::parse_chain(&bytes, None) {
                     Ok(p) => p,
-                    Err(_) => (crate::storage::log::Record { tag: crate::storage::log::TAG_DEL, key: Vec::new(), hlc: 0, replica: [0u8; 32], author: [0u8; 32], value: Vec::new(), expires_at: 0 }, [0u8; 32]),
+                    Err(_) => (crate::storage::log::Record { tag: crate::storage::log::TAG_DEL, key: Vec::new(), hlc: 0, replica: [0u8; 32], author: [0u8; 32], value: Vec::new(), expires_at: 0, ops: Vec::new() }, [0u8; 32]),
                 };
                 let hash = crate::storage::log::Record::record_hash(&prev, &bytes);
                 let payload = json!({ "ns": ns, "seq": seq, "hash": hex::encode(&hash) });

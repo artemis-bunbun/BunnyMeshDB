@@ -13,7 +13,7 @@
 //! Applying is `Store::apply_synced`: LWW keeps max (hlc, replica),
 //! Register keeps all versions, tombstones win over any version.
 
-use crate::storage::log::{Record, TAG_DEL, TAG_INDEX, TAG_PUT, TAG_PUT_TTL, TAG_SCHEMA};
+use crate::storage::log::{Record, TAG_BATCH, TAG_DEL, TAG_INDEX, TAG_PUT, TAG_PUT_TTL, TAG_SCHEMA};
 
 #[derive(Debug)]
 pub enum MergeError {
@@ -51,7 +51,7 @@ pub fn verify_batch(
             .map_err(|e| MergeError::Corrupt(format!("record {seq}: {e}")))?;
         // Tag validity is enforced by parse; double-check semantics here.
         match record.tag {
-            TAG_PUT | TAG_PUT_TTL | TAG_DEL | TAG_SCHEMA | TAG_INDEX => {}
+            TAG_PUT | TAG_PUT_TTL | TAG_DEL | TAG_SCHEMA | TAG_INDEX | TAG_BATCH => {}
             other => {
                 return Err(MergeError::Corrupt(format!("record {seq}: bad tag {:#x}", other)));
             }
@@ -221,6 +221,7 @@ fn dbg_merge_verify() {
             author: A,
             value: b"v".to_vec(),
             expires_at: 0,
+            ops: Vec::new(),
         };
         let bytes = r.to_bytes([0u8; 32]);
         // ...and a corrupt copy (bit flip in value).
@@ -239,13 +240,52 @@ fn dbg_merge_verify() {
     fn batch_with_hlc_reversal_still_verifies() {
         // Interleaved sync arrivals legitimately regress HLC; chain is the
         // integrity boundary.
-        let r1 = Record { tag: TAG_PUT, key: b"a".to_vec(), hlc: 100, replica: A, author: A, value: b"x".to_vec(), expires_at: 0 };
+        let r1 = Record { tag: TAG_PUT, key: b"a".to_vec(), hlc: 100, replica: A, author: A, value: b"x".to_vec(), expires_at: 0, ops: Vec::new() };
         let b1 = r1.to_bytes([0u8; 32]);
         let h1 = Record::record_hash(&[0u8; 32], &b1);
-        let r2 = Record { tag: TAG_PUT, key: b"b".to_vec(), hlc: 50, replica: A, author: A, value: b"y".to_vec(), expires_at: 0 };
+        let r2 = Record { tag: TAG_PUT, key: b"b".to_vec(), hlc: 50, replica: A, author: A, value: b"y".to_vec(), expires_at: 0, ops: Vec::new() };
         let b2 = r2.to_bytes(h1);
         let res = verify_batch([0u8; 32], &[(1, b1), (2, b2)]);
         assert!(res.is_ok(), "{res:?}");
         assert_eq!(res.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn verify_accepts_batch_record_and_chains_it() {
+        // A TAG_BATCH record (multiple sub-ops, ONE chain link) passes
+        // sync verification like any other record.
+        let sub1 = Record { tag: TAG_PUT, key: b"a".to_vec(), hlc: 10, replica: A, author: A, value: b"x".to_vec(), expires_at: 0, ops: Vec::new() };
+        // Del sub-op (no placeholder tags inside batches).
+        let sub2 = Record {
+            tag: TAG_DEL,
+            key: b"b".to_vec(),
+            hlc: 11,
+            replica: A,
+            author: A,
+            value: Vec::new(),
+            expires_at: 0,
+            ops: Vec::new(),
+        };
+        let batch = Record {
+            tag: TAG_BATCH,
+            key: Vec::new(),
+            hlc: sub1.hlc,
+            replica: sub1.replica,
+            author: sub1.author,
+            value: Vec::new(),
+            expires_at: 0,
+            ops: vec![sub1, sub2],
+        };
+        let b1 = batch.to_bytes([0u8; 32]);
+        let h1 = Record::record_hash(&[0u8; 32], &b1);
+        let next = Record { tag: TAG_PUT, key: b"c".to_vec(), hlc: 12, replica: A, author: A, value: b"z".to_vec(), expires_at: 0, ops: Vec::new() };
+        let b2 = next.to_bytes(h1);
+        let res = verify_batch([0u8; 32], &[(1, b1), (2, b2)]);
+        assert!(res.is_ok(), "{res:?}");
+        let parsed = res.unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].tag, TAG_BATCH, "batch record survives sync verification");
+        assert_eq!(parsed[0].ops.len(), 2);
+        assert_eq!(parsed[0].ops[1].tag, TAG_DEL);
     }
 }

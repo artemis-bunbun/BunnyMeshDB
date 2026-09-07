@@ -544,6 +544,16 @@ impl Runner {
                             let mut out = Vec::new();
                             let mut bytes = 0usize;
                             for (seq, payload) in recs {
+                                if payload.len() > MAX_FRAME_BYTES {
+                                    // A single record bigger than the chunk
+                                    // budget: send it ALONE rather than skip
+                                    // it — an empty chunk makes the puller
+                                    // re-pull forever from the same seq.
+                                    if out.is_empty() {
+                                        out.push(Rec { seq, payload_b64: b64_encode(&payload) });
+                                    }
+                                    break;
+                                }
                                 if out.len() >= MAX_RECORDS || bytes + payload.len() > MAX_FRAME_BYTES {
                                     break;
                                 }

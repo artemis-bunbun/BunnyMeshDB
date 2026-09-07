@@ -7,7 +7,7 @@
 
 pub mod log;
 
-use crate::storage::log::{Log, RecoverWarning, Record, TAG_DEL, TAG_INDEX, TAG_PUT, TAG_PUT_TTL, TAG_SCHEMA};
+use crate::storage::log::{Log, RecoverWarning, Record, TAG_BATCH, TAG_DEL, TAG_INDEX, TAG_PUT, TAG_PUT_TTL, TAG_SCHEMA};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -553,10 +553,6 @@ impl Store {
         author: [u8; 32],
         expires_at: u64,
     ) -> Result<u64, StorageError> {
-        let policy = *self
-            .policies
-            .get(ns)
-            .ok_or_else(|| StorageError::BadName(ns.to_string()))?;
         let log = self
             .logs
             .get_mut(ns)
@@ -569,32 +565,11 @@ impl Store {
             author,
             value: value.to_vec(),
             expires_at,
+            ops: Vec::new(),
         };
         let bytes = record.to_bytes(log.head());
         let seq = log.append(&bytes)?;
-        let version = Version { hlc, replica, author, value: value.to_vec(), seq, expires_at };
-        let entry_key = (ns.to_string(), key.clone());
-        // A local write is new user intent: it resurrects the key.
-        self.tombs.remove(&entry_key);
-        match policy {
-            ConflictPolicy::Lww => {
-                self.index.insert(entry_key, Entry::Lww(version));
-            }
-            ConflictPolicy::CrdtRegister => match self.index.get_mut(&entry_key) {
-                Some(Entry::Register(vs)) => vs.push(version),
-                Some(_) => {
-                    return Err(StorageError::Corrupt {
-                        ns: Some(ns.to_string()),
-                        detail: "register policy entry not a Register".into(),
-                    })
-                }
-                None => {
-                    self.index.insert(entry_key, Entry::Register(vec![version]));
-                }
-            },
-        }
-        self.refresh_sec_index_for(ns, key);
-        self.revision += 1;
+        self.apply_local_op(ns, record.tag, &record.key, record.hlc, record.replica, record.author, &record.value, record.expires_at, seq)?;
         Ok(seq)
     }
 
@@ -623,14 +598,113 @@ impl Store {
             author,
             value: Vec::new(),
             expires_at: 0,
+            ops: Vec::new(),
         };
         let bytes = record.to_bytes(log.head());
         let seq = log.append(&bytes)?;
+        self.apply_local_op(ns, record.tag, &record.key, record.hlc, record.replica, record.author, &record.value, record.expires_at, seq)?;
+        Ok(seq)
+    }
+
+    /// Apply a locally-originated op to the in-memory index (not the log)
+    /// with local-write semantics: a local write is new user intent, so it
+    /// resurrects a tombstoned key, and LWW-policy entries accept it
+    /// unconditionally. `seq` is the log record number that carries the op.
+    fn apply_local_op(
+        &mut self,
+        ns: &str,
+        tag: u8,
+        key: &Key,
+        hlc: u64,
+        replica: [u8; 32],
+        author: [u8; 32],
+        value: &[u8],
+        expires_at: u64,
+        seq: u64,
+    ) -> Result<(), StorageError> {
+        let policy = *self
+            .policies
+            .get(ns)
+            .ok_or_else(|| StorageError::BadName(ns.to_string()))?;
         let entry_key = (ns.to_string(), key.clone());
-        self.index.remove(&entry_key);
-        self.tombs.insert(entry_key, hlc);
-        self.remove_from_sec_index(ns, key);
+        match tag {
+            TAG_PUT | TAG_PUT_TTL => {
+                let version = Version { hlc, replica, author, value: value.to_vec(), seq, expires_at };
+                // A local write is new user intent: it resurrects the key.
+                self.tombs.remove(&entry_key);
+                match policy {
+                    ConflictPolicy::Lww => {
+                        self.index.insert(entry_key, Entry::Lww(version));
+                    }
+                    ConflictPolicy::CrdtRegister => match self.index.get_mut(&entry_key) {
+                        Some(Entry::Register(vs)) => vs.push(version),
+                        Some(_) => {
+                            return Err(StorageError::Corrupt {
+                                ns: Some(ns.to_string()),
+                                detail: "register policy entry not a Register".into(),
+                            })
+                        }
+                        None => {
+                            self.index.insert(entry_key, Entry::Register(vec![version]));
+                        }
+                    },
+                }
+                self.refresh_sec_index_for(ns, key);
+            }
+            TAG_DEL => {
+                self.index.remove(&entry_key);
+                self.tombs.insert(entry_key, hlc);
+                self.remove_from_sec_index(ns, key);
+            }
+            other => {
+                return Err(StorageError::Corrupt {
+                    ns: Some(ns.to_string()),
+                    detail: format!("bad tag {other}"),
+                })
+            }
+        }
         self.revision += 1;
+        Ok(())
+    }
+
+    /// Write a batch of ops as ONE log record — one chain link, one dedupe
+    /// identity `(TAG_BATCH, hlc, replica)` (the FIRST sub-op's), one atomic
+    /// apply. Sub-ops run in payload order with local-write semantics, so
+    /// the namespace state is exactly the batch's final state (a later sub-op
+    /// on the same key wins; DEL tombstones; PUT resurrects). Returns the
+    /// batch record's seq. Mesh peers replicate or replay it as a single
+    /// unit — no partial application is possible.
+    pub fn put_batch(&mut self, ns: &str, ops: &[Record]) -> Result<u64, StorageError> {
+        if ops.is_empty() {
+            return Err(StorageError::BadName(ns.to_string()));
+        }
+        if !self.policies.contains_key(ns) {
+            return Err(StorageError::BadName(ns.to_string()));
+        }
+        let log = self
+            .logs
+            .get_mut(ns)
+            .ok_or(StorageError::NotFound(ns.to_string()))?;
+        let first = &ops[0];
+        let mut ops_clone: Vec<Record> = Vec::with_capacity(ops.len());
+        for op in ops {
+            ops_clone.push(op.clone());
+        }
+        let record = Record {
+            tag: TAG_BATCH,
+            key: Vec::new(),
+            hlc: first.hlc,
+            replica: first.replica,
+            author: first.author,
+            value: Vec::new(),
+            expires_at: 0,
+            ops: ops_clone,
+        };
+        let bytes = record.to_bytes(log.head());
+        let seq = log.append(&bytes)?;
+        for op in ops {
+            self.apply_local_op(ns, op.tag, &op.key, op.hlc, op.replica, op.author, &op.value, op.expires_at, seq)?;
+        }
         Ok(seq)
     }
 
@@ -681,6 +755,7 @@ impl Store {
             author,
             value: value.map(|v| v.to_vec()).unwrap_or_default(),
             expires_at: 0,
+            ops: Vec::new(),
         };
         let bytes = record.to_bytes(log.head());
         let seq = log.append(&bytes)?;
@@ -974,20 +1049,84 @@ impl Store {
     /// Apply a replayed/synced record to the in-memory state (no log write —
     /// the record is already durable).
     fn apply_record(&mut self, ns: &str, record: &Record, seq: u64) -> Result<(), StorageError> {
+        match record.tag {
+            TAG_PUT | TAG_PUT_TTL | TAG_DEL => {
+                self.apply_record_op(ns, record.tag, &record.key, record.hlc, record.replica, record.author, &record.value, record.expires_at, seq)?;
+            }
+            TAG_BATCH => {
+                // Sub-ops share the batch record's seq and dedupe identity,
+                // so a synced/replayed batch applies (or is skipped) as one
+                // atomic unit — no partial application is possible.
+                for op in &record.ops {
+                    self.apply_record_op(ns, op.tag, &op.key, op.hlc, op.replica, op.author, &op.value, op.expires_at, seq)?;
+                }
+            }
+            TAG_SCHEMA => {
+                // Namespace schema (metadata, not a user key). Empty value =
+                // clear. Stored in the snapshot-persisted meta map keyed by
+                // "schema/<ns>"; replicated through the log so every peer
+                // enforces the same shape.
+                let meta_key = format!("schema/{ns}");
+                if record.value.is_empty() {
+                    self.meta.remove(&meta_key);
+                } else {
+                    self.meta.insert(meta_key, record.value.clone());
+                }
+            }
+            TAG_INDEX => {
+                // Namespace secondary-index definition (metadata, not a user
+                // key). Empty value = clear the definition. Replicated so
+                // every peer derives the same index from the same values.
+                let meta_key = format!("index/{ns}");
+                if record.value.is_empty() {
+                    self.meta.remove(&meta_key);
+                } else {
+                    self.meta.insert(meta_key, record.value.clone());
+                }
+                // Definitions also change which fields are queriable, so
+                // refresh the derived index for this namespace.
+                self.rebuild_sec_index_ns(ns)?;
+            }
+            other => {
+                return Err(StorageError::Corrupt {
+                    ns: Some(ns.to_string()),
+                    detail: format!("bad tag {other}"),
+                })
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply ONE synced/replayed data op (PUT/PUT_TTL/DEL) to the in-memory
+    /// index with sync semantics: LWW keeps max (hlc, replica), Register
+    /// retains every version, tombstones win over any version. `seq` is the
+    /// carrying record's number in the namespace log.
+    fn apply_record_op(
+        &mut self,
+        ns: &str,
+        tag: u8,
+        key: &Key,
+        hlc: u64,
+        replica: [u8; 32],
+        author: [u8; 32],
+        value: &[u8],
+        expires_at: u64,
+        seq: u64,
+    ) -> Result<(), StorageError> {
         let policy = *self
             .policies
             .get(ns)
             .ok_or_else(|| StorageError::BadName(ns.to_string()))?;
-        let entry_key = (ns.to_string(), record.key.clone());
-        match record.tag {
+        let entry_key = (ns.to_string(), key.clone());
+        match tag {
             TAG_PUT | TAG_PUT_TTL => {
                 let version = Version {
-                    hlc: record.hlc,
-                    replica: record.replica,
-                    author: record.author,
-                    value: record.value.clone(),
+                    hlc,
+                    replica,
+                    author,
+                    value: value.to_vec(),
                     seq,
-                    expires_at: record.expires_at,
+                    expires_at,
                 };
                 match policy {
                     ConflictPolicy::Lww => {
@@ -1019,38 +1158,12 @@ impl Store {
                 // Synced/replayed writes must also feed the derived indexes so
                 // by_index answers identically on every peer. Reads live state
                 // (the entry we just updated), so LWW staleness is handled.
-                self.refresh_sec_index_for(ns, &record.key);
+                self.refresh_sec_index_for(ns, key);
             }
             TAG_DEL => {
                 self.index.remove(&entry_key);
-                self.tombs.insert(entry_key, record.hlc);
-                self.remove_from_sec_index(ns, &record.key);
-            }
-            TAG_SCHEMA => {
-                // Namespace schema (metadata, not a user key). Empty value =
-                // clear. Stored in the snapshot-persisted meta map keyed by
-                // "schema/<ns>"; replicated through the log so every peer
-                // enforces the same shape.
-                let meta_key = format!("schema/{ns}");
-                if record.value.is_empty() {
-                    self.meta.remove(&meta_key);
-                } else {
-                    self.meta.insert(meta_key, record.value.clone());
-                }
-            }
-            TAG_INDEX => {
-                // Namespace secondary-index definition (metadata, not a user
-                // key). Empty value = clear the definition. Replicated so
-                // every peer derives the same index from the same values.
-                let meta_key = format!("index/{ns}");
-                if record.value.is_empty() {
-                    self.meta.remove(&meta_key);
-                } else {
-                    self.meta.insert(meta_key, record.value.clone());
-                }
-                // Definitions also change which fields are queriable, so
-                // refresh the derived index for this namespace.
-                self.rebuild_sec_index_ns(ns)?;
+                self.tombs.insert(entry_key, hlc);
+                self.remove_from_sec_index(ns, key);
             }
             other => {
                 return Err(StorageError::Corrupt {
@@ -1177,6 +1290,7 @@ impl Store {
             author,
             value: value.map(|v| v.to_vec()).unwrap_or_default(),
             expires_at: 0,
+            ops: Vec::new(),
         };
         let bytes = record.to_bytes(log.head());
         let seq = log.append(&bytes)?;
@@ -1246,6 +1360,7 @@ impl Store {
                             author: v.author,
                             value: v.value.clone(),
                             expires_at: v.expires_at,
+                            ops: Vec::new(),
                         });
                     }
                     Entry::Register(vs) => {
@@ -1261,6 +1376,7 @@ impl Store {
                                 author: v.author,
                                 value: v.value.clone(),
                                 expires_at: v.expires_at,
+                                ops: Vec::new(),
                             });
                         }
                     }
@@ -1282,6 +1398,7 @@ impl Store {
                     author: [0u8; 32],
                     value: Vec::new(),
                     expires_at: 0,
+                    ops: Vec::new(),
                 });
             }
             if !out.is_empty() {
@@ -1411,6 +1528,7 @@ compaction is only safe on a standalone node",
                         author: v.author,
                         value: v.value.clone(),
                         expires_at: v.expires_at,
+                        ops: Vec::new(),
                     });
                 }
                 Entry::Register(vs) => {
@@ -1426,6 +1544,7 @@ compaction is only safe on a standalone node",
                             author: v.author,
                             value: v.value.clone(),
                             expires_at: v.expires_at,
+                            ops: Vec::new(),
                         });
                     }
                 }
@@ -1448,6 +1567,7 @@ compaction is only safe on a standalone node",
                 author: [0u8; 32],
                 value: Vec::new(),
                 expires_at: 0,
+                ops: Vec::new(),
             });
         }
         if out.is_empty() {
@@ -1818,6 +1938,7 @@ mod tests {
             author: B_REP,
             value: b"from-peer".to_vec(),
             expires_at: 7777,
+            ops: Vec::new(),
         };
         assert_eq!(s.apply_synced("n", &rec).unwrap(), true);
         match s.get("n", &b"k".to_vec()).unwrap() {
@@ -1876,6 +1997,169 @@ mod tests {
             Entry::Lww(v) => {
                 assert_eq!(v.value, b"1");
                 assert_eq!(v.expires_at, 0, "v1 snapshot must roll up with no expiry");
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn put_batch_writes_one_record_and_reads_back_all() {
+        let dir = tmpdir("putbatch");
+        let mut s = Store::open(&dir).unwrap();
+        s.create_namespace("n", ConflictPolicy::Lww).unwrap();
+        let ops = vec![
+            crate::storage::log::Record {
+                tag: crate::storage::log::TAG_PUT,
+                key: b"a".to_vec(),
+                hlc: 1,
+                replica: [1u8; 32],
+                author: [2u8; 32],
+                value: b"v1".to_vec(),
+                expires_at: 0,
+                ops: Vec::new(),
+            },
+            crate::storage::log::Record {
+                tag: crate::storage::log::TAG_PUT_TTL,
+                key: b"b".to_vec(),
+                hlc: 2,
+                replica: [1u8; 32],
+                author: [2u8; 32],
+                value: b"v2".to_vec(),
+                expires_at: 4_000_000,
+                ops: Vec::new(),
+            },
+            crate::storage::log::Record {
+                tag: crate::storage::log::TAG_DEL,
+                key: b"c".to_vec(),
+                hlc: 3,
+                replica: [1u8; 32],
+                author: [2u8; 32],
+                value: Vec::new(),
+                expires_at: 0,
+                ops: Vec::new(),
+            },
+        ];
+        let seq = s.put_batch("n", &ops).unwrap();
+        assert_eq!(seq, 1, "three ops consumed exactly ONE log record");
+        match s.get("n", &b"a".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.value, b"v1"),
+            _ => panic!(),
+        }
+        match s.get("n", &b"b".to_vec()).unwrap() {
+            Entry::Lww(v) => {
+                assert_eq!(v.value, b"v2");
+                assert_eq!(v.expires_at, 4_000_000, "TTL survives the batch record");
+            }
+            _ => panic!(),
+        }
+        assert_eq!(s.get("n", &b"c".to_vec()), None, "del tombstoned");
+        // The log holds ONE batch record; reprsing it applies to a fresh store.
+        let bytes = s.log_records("n", 1).unwrap().first().unwrap().1.clone();
+        let (rec, _) = crate::storage::log::Record::parse_chain(&bytes, None).unwrap();
+        assert_eq!(rec.tag, crate::storage::log::TAG_BATCH);
+        assert_eq!(rec.ops.len(), 3);
+        drop(s);
+        let s2 = Store::open(&dir).unwrap();
+        match s2.get("n", &b"a".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.value, b"v1", "replay after reopen converges"),
+            _ => panic!(),
+        }
+        // Sync apply + atomic dedupe on a FRESH store: the batch record is
+        // ONE dedupe identity, so applying it twice applies it once.
+        let dir3 = tmpdir("batchdedupe");
+        let mut s3 = Store::open(&dir3).unwrap();
+        let _ = s3.create_namespace("n", ConflictPolicy::Lww).unwrap();
+        let (record, _) = crate::storage::log::Record::parse_chain(&bytes, None).unwrap();
+        assert_eq!(s3.apply_synced("n", &record).unwrap(), true);
+        assert_eq!(s3.apply_synced("n", &record).unwrap(), false, "batch dedupes atomically");
+        match s3.get("n", &b"a".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.value, b"v1"),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn put_batch_order_and_resurrect_semantics() {
+        let dir = tmpdir("batchorder");
+        let mut s = Store::open(&dir).unwrap();
+        s.create_namespace("n", ConflictPolicy::Lww).unwrap();
+        // DEL then PUT same key in one batch: the PUT resurrects (local-write
+        // semantics), so the final state is the value — matching what the
+        // batch endpoint's earlier per-op PUT did.
+        let mut ops: Vec<crate::storage::log::Record> = Vec::new();
+        ops.push(crate::storage::log::Record {
+            tag: crate::storage::log::TAG_PUT,
+            key: b"k".to_vec(),
+            hlc: 1,
+            replica: [1u8; 32],
+            author: [2u8; 32],
+            value: b"first".to_vec(),
+            expires_at: 0,
+            ops: Vec::new(),
+        });
+        ops.push(crate::storage::log::Record {
+            tag: crate::storage::log::TAG_DEL,
+            key: b"k".to_vec(),
+            hlc: 2,
+            replica: [1u8; 32],
+            author: [2u8; 32],
+            value: Vec::new(),
+            expires_at: 0,
+            ops: Vec::new(),
+        });
+        ops.push(crate::storage::log::Record {
+            tag: crate::storage::log::TAG_PUT,
+            key: b"k".to_vec(),
+            hlc: 3,
+            replica: [1u8; 32],
+            author: [2u8; 32],
+            value: b"resurrected".to_vec(),
+            expires_at: 0,
+            ops: Vec::new(),
+        });
+        s.put_batch("n", &ops).unwrap();
+        match s.get("n", &b"k".to_vec()).unwrap() {
+            Entry::Lww(v) => assert_eq!(v.value, b"resurrected"),
+            _ => panic!(),
+        }
+        // Register policy: repeated key in one batch retains every version.
+        let dir2 = tmpdir("batchreg");
+        let mut r = Store::open(&dir2).unwrap();
+        r.create_namespace("rk", ConflictPolicy::CrdtRegister).unwrap();
+        let a = crate::storage::log::Record {
+            tag: crate::storage::log::TAG_PUT,
+            key: b"x".to_vec(),
+            hlc: 1,
+            replica: [1u8; 32],
+            author: [2u8; 32],
+            value: b"one".to_vec(),
+            expires_at: 0,
+            ops: Vec::new(),
+        };
+        let b_rec = crate::storage::log::Record {
+            tag: crate::storage::log::TAG_PUT,
+            key: b"x".to_vec(),
+            hlc: 2,
+            replica: [1u8; 32],
+            author: [2u8; 32],
+            value: b"two".to_vec(),
+            expires_at: 0,
+            ops: Vec::new(),
+        };
+        let _ = r.put_batch("rk", &vec![a, b_rec]).unwrap();
+        match r.get("rk", &b"x".to_vec()).unwrap() {
+            Entry::Register(vs) => {
+                assert_eq!(vs.len(), 2, "both batch sub-ops retained under Register");
+                assert_eq!(vs[1].value, b"two");
+            }
+            _ => panic!(),
+        }
+        // gc_live must survive a batch record in the log (standalone only).
+        let reclaimed = s.gc_live().unwrap();
+        let _ = reclaimed;
+        match s.get("n", &b"k".to_vec()).unwrap() {
+            Entry::Lww(v) => {
+                assert_eq!(v.value, b"resurrected", "state survives compaction");
             }
             _ => panic!(),
         }
