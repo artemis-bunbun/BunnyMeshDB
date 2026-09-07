@@ -1097,6 +1097,21 @@ fn handle_data(
     match method {
         Method::GET => {
             if let Some(p) = query.get("prefix") {
+                // Authorization must cover the SCAN prefix, not just the URL
+                // key: a capability scoped to prefix `a` may only scan within
+                // `a`, never sibling prefixes selected via ?prefix= (the
+                // URL-key-derived scope alone would authorize `a/x` and then
+                // let the query escape the cap's prefix).
+                let scan_scope = Scope {
+                    host: state.host_name.clone(),
+                    tier,
+                    ns: ns.to_string(),
+                    prefix: Some(p.to_string()),
+                };
+                match auth_l1_l2(&state, caps, &scan_scope, PermSet::READ, now_ms()) {
+                    Ok(_) => {}
+                    Err(r) => return r,
+                }
                 let store = state.store.read();
                 let rows = store.scan(ns, p.as_bytes());
                 let now = now_ms();

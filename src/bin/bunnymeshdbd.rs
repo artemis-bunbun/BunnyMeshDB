@@ -29,8 +29,11 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[derive(Parser)]
 #[command(name = "bunnymeshdbd", about = "BunnyMeshDB daemon")]
 struct Cli {
+    /// Print the release version and exit.
+    #[arg(long)]
+    version: bool,
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -50,7 +53,15 @@ fn main() {
         .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()))
         .init();
     let cli = Cli::parse();
-    let (config_path, mount_at) = match cli.cmd {
+    if cli.version {
+        println!("bunnymeshdbd {}", bunnymeshdb::VERSION);
+        return;
+    }
+    let Some(cmd) = cli.cmd else {
+        eprintln!("error: a subcommand is required (--version shows the release)");
+        std::process::exit(2);
+    };
+    let (config_path, mount_at) = match cmd {
         Cmd::Serve { config, mount } => (config, mount),
     };
     let cfg = match Config::load(&config_path) {

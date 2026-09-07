@@ -960,6 +960,23 @@ impl Store {
         out
     }
 
+    /// Scan keys under `prefix` — keys ONLY, no value clone. For listings
+    /// (FUSE readdir) where values are fetched per-key on demand; avoids
+    /// materializing full values under the lock.
+    pub fn scan_keys(&self, ns: &str, prefix: &[u8]) -> Vec<Key> {
+        let start = (ns.to_string(), Vec::new());
+        let mut out = Vec::new();
+        for ((n, k), _) in self.index.range((Included(start), Unbounded)) {
+            if n != ns {
+                break;
+            }
+            if prefix.is_empty() || k.starts_with(prefix) {
+                out.push(k.clone());
+            }
+        }
+        out
+    }
+
     pub fn log_records(&self, ns: &str, from_seq: u64) -> Result<Vec<(u64, Vec<u8>)>, StorageError> {
         match self.logs.get(ns) {
             Some(log) => log.read_records(from_seq, 0),

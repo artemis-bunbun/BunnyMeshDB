@@ -53,8 +53,11 @@ fn copy_file(src: &Path, dst: &Path) -> Result<(), String> {
 #[derive(Parser)]
 #[command(name = "bunnymeshdb", about = "BunnyMeshDB CLI")]
 struct Cli {
+    /// Print the release version and exit.
+    #[arg(long)]
+    version: bool,
     #[command(subcommand)]
-    cmd: Commands,
+    cmd: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -120,7 +123,15 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    match cli.cmd {
+    if cli.version {
+        println!("bunnymeshdb {}", bunnymeshdb::VERSION);
+        return;
+    }
+    let Some(cmd) = cli.cmd else {
+        eprintln!("error: a subcommand is required (--version shows the release)");
+        std::process::exit(2);
+    };
+    match cmd {
         Commands::Init { dir } => {
             let data = dir.join("data");
             match meta::init(&data) {

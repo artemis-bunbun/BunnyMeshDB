@@ -164,7 +164,10 @@ impl Scope {
             && self.tier == other.tier
             && self.ns == other.ns
             && match (&self.prefix, &other.prefix) {
-                (Some(a), Some(b)) => b.starts_with(a),
+                // Segment-bounded prefix coverage: `a` covers `a` and `a/b`
+                // but NEVER the sibling prefix `ab` (raw starts_with would
+                // leak across segment boundaries).
+                (Some(a), Some(b)) => b == a || b.starts_with(&format!("{a}/")),
                 // A prefixed scope never covers an unprefixed (wider) one.
                 (Some(_), None) => false,
                 (None, _) => true,
@@ -360,6 +363,23 @@ impl Capability {
         serde_json::to_vec(&view).expect("canonical capability bytes")
     }
 
+    /// Content-address for the verification cache: a hash of the exact bytes
+    /// that are (or would be) signature-verified — canonical fields PLUS the
+    /// signature. Any alteration to scope, perms, expiry, nonce, issuer,
+    /// subject, or sig changes the digest, so a cache hit can never be
+    /// recycled for a different (forged) capability — the old cache was
+    /// keyed by the attacker-mutable `nonce`, which allowed any cap holder
+    /// to forge an admin cap by replaying their own nonce (CAP-CACHE-FORGE).
+    pub fn digest_hex(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut buf = self.canonical_bytes();
+        buf.extend_from_slice(self.sig.as_slice());
+        let mut h = Sha256::new();
+        h.update(buf.as_slice());
+        let out: [u8; 32] = h.finalize().into();
+        hex::encode(&out)
+    }
+
     pub fn verify(
         &self,
         keyring: &RootKeyring,
@@ -522,6 +542,21 @@ mod tests {
         assert!(base.covers(&pref));
         assert!(!pref.covers(&base));
         assert!(base.covers(&base));
+    }
+
+    #[test]
+    fn prefix_covers_is_segment_bounded() {
+        // A prefixed cap "a" covers "a" and "a/b" but NEVER the sibling
+        // prefix "ab" — that boundary prevents prefixed-cap scope escape.
+        let a = Scope::parse("bmdb://h/l2/n/a").unwrap();
+        let ab = Scope::parse("bmdb://h/l2/n/ab").unwrap();
+        let a_b = Scope::parse("bmdb://h/l2/n/a/b").unwrap();
+        let root = Scope::parse("bmdb://h/l2/n").unwrap();
+        assert!(a.covers(&a));
+        assert!(a.covers(&a_b));
+        assert!(!a.covers(&ab)); // sibling segment is NOT covered
+        assert!(root.covers(&a));
+        assert!(!a.covers(&root)); // prefixed never covers wider
     }
 
     #[test]

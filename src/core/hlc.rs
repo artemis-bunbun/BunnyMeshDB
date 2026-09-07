@@ -5,23 +5,51 @@
 //! backward never regress a timestamp. Cross-host ordering is `(hlc, replica)`
 //! — Hlc alone is not total.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const COUNTER_MASK: u64 = 0xFFFF;
 const PHYS_SHIFT: u32 = 16;
+
+/// Process-global watermark of the last HLC issued by [`Hlc::now`]. Keeps
+/// per-node HLCs strictly increasing: two writes inside the same physical
+/// millisecond used to produce IDENTICAL HLCs, and because the log dedupe
+/// identity is `(tag, hlc, replica)`, the second write was silently dropped
+/// on every synced peer (MESH-004 — same-ms concurrent writes vanished).
+/// Equal-HLC predictability also enabled dedupe squatting.
+static LAST: AtomicU64 = AtomicU64::new(0);
 
 /// Hybrid logical clock value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hlc(u64);
 
 impl Hlc {
-    /// Current wall-clock ms with logical counter 0.
+    /// Current wall-clock ms with a strictly-increasing per-process counter.
     pub fn now() -> Hlc {
         let ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before unix epoch")
             .as_millis() as u64;
-        Hlc(ms << PHYS_SHIFT)
+        let base = ms << PHYS_SHIFT;
+        loop {
+            let cur = LAST.load(Ordering::SeqCst);
+            if base > cur {
+                let expected = cur;
+                if LAST
+                    .compare_exchange_weak(expected, base, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    // Fast path: fresh physical ms, first caller claims it.
+                    return Hlc(base);
+                }
+                continue; // lost the race; retry against the winner
+            }
+            // Same (or earlier, after a clock step back) physical ms as a
+            // previous issue: bump the counter. Fetch-add carries naturally
+            // into the next physical ms once the 16-bit counter saturates
+            // (base + 0xFFFF + 1 == (ms + 1) << 16).
+            return Hlc(LAST.fetch_add(1, Ordering::SeqCst) + 1);
+        }
     }
 
     /// Merge another observed HLC into self. Self never decreases; on the
@@ -130,5 +158,19 @@ mod tests {
         assert_eq!(Hlc::from(h.to_u64()), h);
         assert_eq!(u64::from(h), h.to_u64());
         assert_eq!(h.ms(), h.to_u64() >> PHYS_SHIFT);
+    }
+
+    #[test]
+    fn now_is_strictly_increasing() {
+        // Same-ms writes must never produce equal HLCs (MESH-004): the log
+        // dedupe identity is (tag, hlc, replica), so two equal values in one
+        // millisecond silently drop the second record on every synced peer.
+        let a = Hlc::now();
+        let b = Hlc::now();
+        let c = Hlc::now();
+        assert!(b > a, "two immediate now() calls must be strictly increasing");
+        assert!(c > b);
+        assert_ne!(a, b);
+        assert_ne!(b, c);
     }
 }

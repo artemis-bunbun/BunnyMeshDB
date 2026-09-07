@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0
 
 ### Batched log records (ingest-side batching)
 - The batch endpoint (`/l2/{ns}/batch`, `/l3/u/{pk}/batch`) now writes

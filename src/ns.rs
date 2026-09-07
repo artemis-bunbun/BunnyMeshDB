@@ -63,15 +63,21 @@ pub fn authorize(
 /// verified in; the caller bumps `epoch` whenever a revocation lands, so a
 /// cached hit can only happen when no revocation has occurred since the
 /// verification. Cheap checks (issuer, subject, expiry) always run.
-/// Sharded capability-verify cache: cap `nonce` → `epoch` it was fully
-/// verified in. Reads are lock-free (per-shard atomic ticker guards each
-/// shard's bounded map); writes take only the target shard's lock.
+///
+/// Sharded capability-verify cache: cap `digest_hex` (content-address of the
+/// exact signed bytes) → `epoch` it was fully verified in. Keying by digest
+/// — NOT by the attacker-mutable `nonce` — is what makes the cached path
+/// safe: any forged alteration to the cap changes the digest, so the
+/// signature check cannot be skipped for a different cap than the one that
+/// was verified (see CAP-CACHE-FORGE). Reads are lock-free (per-shard atomic
+/// ticker guards each shard's bounded map); writes take only the target
+/// shard's lock.
 pub struct CapCache {
     /// Per-shard entry generation; bumps when a shard is cleared so in-flight
     /// readers can't see a stale hit after a clear.
     ticks: [AtomicU64; 256],
-    /// Map per shard (indexed by `nonce % 256`).
-    shards: [parking_lot::Mutex<HashMap<u64, u64>>; 256],
+    /// Map per shard (indexed by `digest[..1]` low byte).
+    shards: [parking_lot::Mutex<HashMap<String, u64>>; 256],
     /// Cached epoch per shard (mirror of `ticks` for fast path).
     epochs: [AtomicU64; 256],
 }
@@ -113,7 +119,8 @@ pub fn authorize_cached(
             // expiry, revocation, epoch cache). No header/URL oracle: the pk
             // is not a credential by itself.
             for cap in caps {
-                let cached_ok = epoch_ok(cache.as_deref(), &(*cap).nonce, epoch);
+                let ckey = (*cap).digest_hex();
+                let cached_ok = epoch_ok(cache.as_deref(), &ckey, epoch);
                 let valid = (*cap).verify_or_cached(keyring, principal, revocations, now_ms, cached_ok);
                 if valid.is_err() {
                     continue;
@@ -123,7 +130,7 @@ pub fn authorize_cached(
                     && format!("u/{}", (*cap).subject) == scope.ns
                     && (*cap).perms.contains(perms)
                 {
-                    mark_verified(cache.as_deref(), &(*cap).nonce, epoch, cached_ok);
+                    mark_verified(cache.as_deref(), &ckey, epoch, cached_ok);
                     return Ok(());
                 }
             }
@@ -134,7 +141,8 @@ pub fn authorize_cached(
         Tier::L1 => {
             // L1 caps must be host-root admin scope.
             for cap in caps {
-                let cached_ok = epoch_ok(cache.as_deref(), &(*cap).nonce, epoch);
+                let ckey = (*cap).digest_hex();
+                let cached_ok = epoch_ok(cache.as_deref(), &ckey, epoch);
                 let ok = (*cap).tier_ok(Tier::L1)
                     && (*cap).scope.tier == Tier::L1
                     && (*cap).scope.ns == "*"
@@ -143,7 +151,7 @@ pub fn authorize_cached(
                         .verify_or_cached(keyring, principal, revocations, now_ms, cached_ok)
                         .is_ok();
                 if ok {
-                    mark_verified(cache.as_deref(), &(*cap).nonce, epoch, cached_ok);
+                    mark_verified(cache.as_deref(), &ckey, epoch, cached_ok);
                     return Ok(());
                 }
             }
@@ -151,7 +159,8 @@ pub fn authorize_cached(
         }
         Tier::L2 => {
             for cap in caps {
-                let cached_ok = epoch_ok(cache.as_deref(), &(*cap).nonce, epoch);
+                let ckey = (*cap).digest_hex();
+                let cached_ok = epoch_ok(cache.as_deref(), &ckey, epoch);
                 let valid = (*cap).verify_or_cached(keyring, principal, revocations, now_ms, cached_ok);
                 if valid.is_err() {
                     // Try the next cap; the request is only denied if none hold.
@@ -161,7 +170,7 @@ pub fn authorize_cached(
                     && (*cap).scope.covers(scope)
                     && (*cap).perms.contains(perms)
                 {
-                    mark_verified(cache.as_deref(), &(*cap).nonce, epoch, cached_ok);
+                    mark_verified(cache.as_deref(), &ckey, epoch, cached_ok);
                     return Ok(());
                 }
             }
@@ -173,31 +182,32 @@ pub fn authorize_cached(
     }
 }
 
-/// Was `nonce` fully verified in `epoch`? Lock-free read per shard.
-fn epoch_ok(cache: Option<&CapCache>, nonce: &u64, epoch: u64) -> bool {
+/// Was cap content-digest `key` fully verified in `epoch`? Lock-free read per
+/// shard.
+fn epoch_ok(cache: Option<&CapCache>, key: &str, epoch: u64) -> bool {
     let Some(c) = cache else { return false };
-    let shard = (nonce % 256) as usize;
+    let shard = (key.as_bytes()[0] as usize) % 256;
     let ticks = c.ticks[shard].load(std::sync::atomic::Ordering::Acquire);
     if ticks != c.epochs[shard].load(std::sync::atomic::Ordering::Acquire) {
         // Shard was cleared since the last entry; nothing is valid here.
         return false;
     }
-    c.shards[shard].try_lock().map(|m| m.get(nonce).copied() == Some(epoch)).unwrap_or(false)
+    c.shards[shard].try_lock().map(|m| m.get(key).copied() == Some(epoch)).unwrap_or(false)
 }
 
 /// Record a full verification in `cache` (bounded; caps are few per node).
-fn mark_verified(cache: Option<&CapCache>, nonce: &u64, epoch: u64, cached_ok: bool) {
+fn mark_verified(cache: Option<&CapCache>, key: &str, epoch: u64, cached_ok: bool) {
     let Some(c) = cache else { return };
     if cached_ok {
         return;
     }
-    let shard = (nonce % 256) as usize;
+    let shard = (key.as_bytes()[0] as usize) % 256;
     let mut m = c.shards[shard].lock();
     if m.len() >= 8192 {
         m.clear();
         c.ticks[shard].fetch_add(1, std::sync::atomic::Ordering::Release);
     }
-    m.insert(*nonce, epoch);
+    m.insert(key.to_string(), epoch);
 }
 
 impl Capability {
@@ -308,6 +318,84 @@ mod tests {
             authorize(&s, &owner.public(), PermSet::WRITE, &[owner_cap.clone()], &kr, &rev, "other.test", now_ms()),
             Err(AuthError::Unauthorized(_))
         ));
+    }
+
+    #[test]
+    fn forged_cap_cannot_reuse_cached_nonce() {
+        // CAP-CACHE-FORGE regression: the verification cache is keyed by the
+        // cap's content digest, so replaying a verified cap's nonce into a
+        // forged admin cap (garbage sig) must NOT skip the signature check.
+        let root = Keypair::generate();
+        let user = Keypair::generate();
+        let kr = RootKeyring::current(root.public());
+        let rev = RevocationSet::new();
+        let cache = CapCache::new();
+        let epoch = 0u64;
+
+        let l2 = scope("bmdb://api.test/l2/photos");
+        let legit = Capability::sign_for(
+            l2.clone(),
+            PermSet::READ,
+            Some(now_ms() + 60_000),
+            77,
+            user.public(),
+            &root,
+        );
+        // First use fully verifies and marks the cache.
+        assert!(authorize_cached(
+            &l2,
+            &user.public(),
+            PermSet::READ,
+            &[legit.clone().into()],
+            &kr,
+            &rev,
+            "api.test",
+            now_ms(),
+            Some(&cache),
+            epoch,
+        )
+        .is_ok());
+
+        // Forged admin cap: same nonce (the old cache key!), admin scope,
+        // root issuer, user subject, all-zero invalid signature.
+        let forged = Capability {
+            scope: scope("bmdb://api.test/l1/*"),
+            perms: PermSet::ADMIN,
+            expiry_ms: None,
+            nonce: 77,
+            issuer: root.public(),
+            subject: user.public(),
+            sig: [0u8; 64],
+        };
+        assert!(matches!(
+            authorize_cached(
+                &scope("bmdb://api.test/l1/*"),
+                &user.public(),
+                PermSet::ADMIN,
+                &[forged.into()],
+                &kr,
+                &rev,
+                "api.test",
+                now_ms(),
+                Some(&cache),
+                epoch,
+            ),
+            Err(AuthError::Unauthorized(_))
+        ));
+        // The cached path still serves the LEGIT cap afterwards.
+        assert!(authorize_cached(
+            &l2,
+            &user.public(),
+            PermSet::READ,
+            &[legit.clone().into()],
+            &kr,
+            &rev,
+            "api.test",
+            now_ms(),
+            Some(&cache),
+            epoch,
+        )
+        .is_ok());
     }
 
     #[test]
