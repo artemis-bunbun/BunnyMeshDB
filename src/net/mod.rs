@@ -160,7 +160,16 @@ impl SyncEngine {
             let cfg = self.cfg.lock();
             cfg.node.p2p_listen.clone()
         };
-        match format!("/ip4/0.0.0.0/tcp/{p2p_listen}").parse::<Multiaddr>() {
+        // `p2p_listen` is normally a bare TCP port, wrapped below as
+        // /ip4/0.0.0.0/tcp/<port> (all interfaces). A "/"-containing value is
+        // taken as a full multiaddr and used as-is (bind knob), e.g.
+        // "/ip4/127.0.0.1/tcp/9002" to bind a specific interface.
+        let listen_addr = if p2p_listen.contains('/') {
+            p2p_listen.clone()
+        } else {
+            format!("/ip4/0.0.0.0/tcp/{p2p_listen}")
+        };
+        match listen_addr.parse::<Multiaddr>() {
             Ok(a) => {
                 if let Err(e) = swarm.listen_on(a.clone()) {
                     tracing::warn!(%e, %a, "listen failed");
@@ -517,6 +526,28 @@ impl Runner {
             tracing::warn!(peer = %name, got = %recs.ns, want = %ns, "records for wrong ns");
             self.phase_set(&name, Phase::Idle);
             return;
+        }
+        // MESH-002 residual: per-peer namespace allow-list, enforced at apply
+        // time. A peer scoped to Some(list) may only contribute records to
+        // the listed namespaces; None (the default) = all shared namespaces.
+        // Read fresh from the shared config each batch so live edits apply to
+        // the very next round (same semantics as inbound_access). A skipped
+        // namespace progresses exactly like an empty chunk — warn, mark the
+        // phase Done, and let the next Hello re-evaluate — never a wedge.
+        let allowed = {
+            let cfg = self.engine.cfg.lock();
+            match cfg.peer(&name) {
+                Some(p) => p.namespaces.as_ref().map(|list| list.contains(&ns)),
+                None => None,
+            }
+        };
+        match allowed {
+            Some(false) => {
+                tracing::warn!(peer = %name, ns = %ns, "peer not allowed to contribute to namespace; skipping namespace this round");
+                self.phase_set(&name, Phase::Done);
+                return;
+            }
+            _ => {}
         }
         let mut batch: Vec<(u64, Vec<u8>)> = Vec::with_capacity(recs.records.len());
         for r in &recs.records {

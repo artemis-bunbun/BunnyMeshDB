@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.4.1
+
+### Residual audit closes + threat-model doc
+
+- **ql no longer stalls the daemon (LOCK-ACROSS-BATCH-007 closed)**: the
+  Query DSL now classifies each statement before taking a store lock —
+  reads (`get`/`scan`/`by_index`/`index_fields`/…, including nested call
+  args) run under a **read lock**; only statements containing a mutator
+  (`put`/`del`/`index_create`/`index_drop`, even nested as an argument)
+  take the write lock. A heavy authenticated read query can no longer
+  block every other request. `QueryCtx.store` is now a read/write enum;
+  a mutation reaching a read context fails closed by construction.
+- **Per-peer namespace allow-list (MESH-002/record injection residual
+  closed)**: a peer can now be scoped to contribute records to a
+  **subset of shared namespaces** (`namespaces` on `POST /l1/peers`, or
+  `add_peer`/config). Default remains "all shared namespaces" (today's
+  behavior), but least-privilege mesh contribution is now possible —
+  a pinned peer is no longer implicitly trusted across the whole store.
+- **p2p_listen accepts a full multiaddr**: `/ip4/127.0.0.1/tcp/9002` binds
+  loopback; a bare port keeps the legacy `0.0.0.0` wildcard bind
+  (documented — prefer the explicit form in production).
+- **SECURITY.md**: threat model, trust boundaries, attack classes,
+  deployment notes, known residual boundaries, and the full audit-status
+  table. The artifact that turns the v0.4.0 audit into a
+  buy/procurement-ready security story.
+- Tests: 88/88 cargo (+`classify` mutator detection incl. nested,
+  read-context fails-closed, `add_peer` allow-list round-trip,
+  duplicate-pin refusal).
+
 ## v0.4.0
 
 ### Security audit — capability, HTTP, mesh, FUSE (3 parallel audits, 26 findings)

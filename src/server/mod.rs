@@ -8,7 +8,7 @@ use crate::caps::{Capability, PermSet, RevocationSet, RootKeyring, Scope, Tier, 
 use crate::core::hlc::Hlc;
 use crate::core::ident::{Keypair, PublicKey};
 use crate::ns::{account_write, authorize_cached, ensure_l3_namespace, CapCache};
-use crate::query::{QueryCtx, eval};
+use crate::query::{QueryCtx, StoreRef, StmtKind, classify, eval};
 use crate::schema::{check_supported, validate_schema};
 use crate::server::ratelimit::RateLimiter;
 use crate::storage::{ConflictPolicy, Entry, StorageError, Store, Version};
@@ -406,10 +406,15 @@ struct AddPeerBody {
     /// Hello (see MESH-003).
     #[serde(default)]
     pin: String,
+    /// Optional per-peer namespace allow-list (MESH-002): when present the
+    /// peer may only contribute records to these namespaces. Absent/null =
+    /// all shared namespaces (today's behavior).
+    #[serde(default)]
+    namespaces: Option<Vec<String>>,
 }
 
 /// POST /l1/peers — add a peer (persisted to config; picked up by the mesh
-/// engine on its next kick). Body: `{ "name", "addr", "pin"? }`.
+/// engine on its next kick). Body: `{ "name", "addr", "pin"?, "namespaces"? }`.
 async fn l1_peers_add(
     State(state): State<AppState>,
     Extension(caps): Extension<Option<AuthCaps>>,
@@ -420,7 +425,7 @@ async fn l1_peers_add(
         Err(r) => return r,
     }
     let mut cfg = state.config.lock();
-    match cfg.add_peer(&body.name, &body.addr, &body.pin) {
+    match cfg.add_peer_scoped(&body.name, &body.addr, &body.pin, body.namespaces) {
         Ok(()) => {}
         Err(e) => return err_json(StatusCode::BAD_REQUEST, format!("{e}").as_str()),
     }
@@ -1354,17 +1359,44 @@ fn run_ql(state: &AppState, caps: Option<&AuthCaps>, ns: &str, expr: &str) -> Re
         Ok(_) => {}
         Err(r) => return r,
     }
-    // LOCK-ACROSS-BATCH-007: eval runs under the write lock. The language is
-    // not read-only over HTTP — `put`, `del`, `index_create`, `index_drop`
-    // all mutate and are NOT gated (only `use`/`create_ns` are refused for
-    // remote callers), and `QueryCtx.store` is typed `&mut Store`, so a
-    // read-lock fast path is impossible without a query-module rework. The
-    // lock is therefore kept (atomic single-statement semantics, same as a
-    // batch apply); the attacker-schedulable cost here is bounded by the
-    // parser/statement count, not by the lock itself.
-    let mut store = state.store.write();
-    let mut ctx = QueryCtx { store: &mut store, scope: Some(ns.to_string()), host_id: state.root, remote: true };
-    match eval(&mut ctx, expr) {
+    // LOCK-ACROSS-BATCH-007: a statement that only READS runs under a read
+    // lock (a heavy read query must not stall the whole node); only a
+    // statement containing a mutator (put/del/index_create/index_drop, even
+    // nested as an argument) takes the write lock. classify() parses with
+    // the exact grammar eval() uses, so a ReadOnly verdict guarantees exec
+    // can never mutate — the read path is sound, and a mutation reaching a
+    // Read context fails closed (QueryCtx::store_mut errors).
+    match classify(expr) {
+        Err(e) => {
+            tracing::warn!(%e, "ql parse");
+            err_json(StatusCode::BAD_REQUEST, "query_error")
+        }
+        Ok(StmtKind::Mutating) => {
+            let mut store = state.store.write();
+            let mut ctx = QueryCtx {
+                store: StoreRef::Write(&mut store),
+                scope: Some(ns.to_string()),
+                host_id: state.root,
+                remote: true,
+            };
+            ql_reply(&mut ctx, expr)
+        }
+        Ok(StmtKind::ReadOnly) => {
+            let store = state.store.read();
+            let mut ctx = QueryCtx {
+                store: StoreRef::Read(&store),
+                scope: Some(ns.to_string()),
+                host_id: state.root,
+                remote: true,
+            };
+            ql_reply(&mut ctx, expr)
+        }
+    }
+}
+
+/// Shared eval→response mapping for both ql lock paths.
+fn ql_reply(ctx: &mut QueryCtx, expr: &str) -> Response {
+    match eval(ctx, expr) {
         Ok(v) => {
             let j: JValue = serde_json::from_str(&v.json()).unwrap_or(JValue::Null);
             Json(j).into_response()

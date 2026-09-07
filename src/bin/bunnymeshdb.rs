@@ -3,7 +3,7 @@
 #![deny(warnings)]
 
 use bunnymeshdb::core::meta;
-use bunnymeshdb::query::{QueryCtx, eval};
+use bunnymeshdb::query::{QueryCtx, StoreRef, eval};
 use bunnymeshdb::storage::Store;
 use clap::{Parser, Subcommand};
 use std::fs::OpenOptions;
@@ -287,7 +287,7 @@ fn main() {
                 }
             };
             let host_id = kp.public();
-            let mut ctx = QueryCtx { store: &mut store, scope: None, host_id, remote: false };
+            let mut ctx = QueryCtx { store: StoreRef::Write(&mut store), scope: None, host_id, remote: false };
             repl(&mut ctx);
         }
     }

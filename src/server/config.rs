@@ -116,6 +116,12 @@ pub struct Peer {
     /// TOFU pin — peer host_id hex, filled on first successful Hello.
     #[serde(default)]
     pub pin: String,
+    /// Per-peer namespace allow-list (MESH-002 residual). Some(list) restricts
+    /// this peer to contributing records to ONLY the listed namespaces —
+    /// enforced server-locally at apply time, no protocol change; None (the
+    /// default) = all shared namespaces, exactly as before.
+    #[serde(default)]
+    pub namespaces: Option<Vec<String>>,
 }
 
 impl Default for Config {
@@ -249,12 +255,30 @@ impl Config {
         self.peers.iter().find(|p| p.name == name)
     }
 
-    /// Add a peer (name + libp2p multiaddr + optional TOFU pin seed).
+    /// Add a peer (name + libp2p multiaddr + optional TOFU pin seed) with no
+    /// namespace restriction — shorthand for `add_peer_scoped(..., None)`.
+    /// Kept for existing callers; new callers should prefer `add_peer_scoped`.
+    pub fn add_peer(&mut self, name: &str, addr: &str, pin: &str) -> Result<(), String> {
+        self.add_peer_scoped(name, addr, pin, None)
+    }
+
+    /// Add a peer (name + libp2p multiaddr + optional TOFU pin seed) with an
+    /// optional per-peer namespace allow-list (MESH-002 residual). When
+    /// `namespaces` is Some(list), the peer may only contribute records to
+    /// the listed namespaces — enforced server-locally at apply time, no
+    /// protocol change; None (the default) means all shared namespaces,
+    /// exactly as before.
     /// Errors if the name already exists, the addr is not a valid multiaddr,
     /// the pin (when non-empty) is not a valid host public key, or another
     /// peer already pins the same key (duplicate peer identity — MESH-007).
     /// An empty `pin` means first-contact TOFU, exactly as before.
-    pub fn add_peer(&mut self, name: &str, addr: &str, pin: &str) -> Result<(), String> {
+    pub fn add_peer_scoped(
+        &mut self,
+        name: &str,
+        addr: &str,
+        pin: &str,
+        namespaces: Option<Vec<String>>,
+    ) -> Result<(), String> {
         if self.peer(name).is_some() {
             return Err(format!("peer {name:?} already exists"));
         }
@@ -274,7 +298,12 @@ impl Config {
                 }
             }
         }
-        self.peers.push(Peer { name: name.to_string(), addr: addr.to_string(), pin: pin.to_string() });
+        self.peers.push(Peer {
+            name: name.to_string(),
+            addr: addr.to_string(),
+            pin: pin.to_string(),
+            namespaces: namespaces.map(|list| list.clone()),
+        });
         Ok(())
     }
 
@@ -325,6 +354,8 @@ addr = "/ip4/127.0.0.1/tcp/9002"
         assert!(cfg.node.data_dir.starts_with(&dir.to_string_lossy().into_owned()));
         assert_eq!(cfg.peers.len(), 1);
         assert_eq!(cfg.peers[0].pin, "");
+        // namespaces allow-list defaults to None (all shared namespaces).
+        assert_eq!(cfg.peers[0].namespaces, None);
     }
 
     #[test]
@@ -351,6 +382,22 @@ addr = "/ip4/127.0.0.1/tcp/9002"
         // Empty pin (TOFU) is still fine for a new peer.
         cfg.add_peer("b", "/ip4/127.0.0.1/tcp/9101", "").unwrap();
         assert_eq!(cfg.peer("b").unwrap().pin, "");
+        // Unscoped peers keep the legacy None = all shared namespaces.
+        assert_eq!(cfg.peer("b").unwrap().namespaces, None);
+        // MESH-002 residual: add_peer_scoped persists the per-peer namespace
+        // allow-list (server-local, enforced at apply time in the sync path).
+        let mut allow: Vec<String> = Vec::new();
+        allow.push("alpha".to_string());
+        allow.push("beta".to_string());
+        cfg.add_peer_scoped("c", "/ip4/127.0.0.1/tcp/9102", "", Some(allow)).unwrap();
+        match &cfg.peer("c").unwrap().namespaces {
+            Some(list) => {
+                assert_eq!(list.len(), 2);
+                assert_eq!(list[0], "alpha");
+                assert_eq!(list[1], "beta");
+            }
+            None => panic!("scoped peer must carry its namespace allow-list"),
+        }
     }
 
     #[test]
