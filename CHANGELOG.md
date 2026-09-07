@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Release workflow fix
+- `softprops/action-gh-release` was 403ing ("Resource not accessible by
+  integration") because the job's `GITHUB_TOKEN` was read-only. No GitHub
+  Release was ever created — v0.1.0 through v0.4.1 tags shipped without
+  attached binaries. The `build` job now grants `contents: write`
+  explicitly; the v0.4.1 tag was re-cut to backfill its release. Node on
+  both workflows is pinned to 24 (20 is deprecated on runners).
+
 ## v0.4.1
 
 ### Residual audit closes + threat-model doc

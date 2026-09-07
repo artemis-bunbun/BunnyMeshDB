@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
       - name: Install deps
         run: cd sdk && npm install
       - name: Typecheck + build
@@ -41,7 +41,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
       - name: Build daemon
         run: cargo build --release
       - name: Build SDK
