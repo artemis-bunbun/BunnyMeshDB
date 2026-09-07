@@ -83,7 +83,7 @@ mod tests {
         let head = [0u8; 32];
         let mut prev = head;
         let mut out = Vec::new();
-        for (_, bytes) in store.log_records(ns, 1).unwrap() {
+        for (_, bytes) in store.log_records(ns, 1, 0).unwrap() {
             let (rec, p) = Record::parse_chain(&bytes, Some(&prev)).unwrap();
             prev = Record::record_hash(&p, &bytes);
             out.push(rec);
@@ -94,7 +94,7 @@ mod tests {
     /// Simulate sync: pull records from `src` ns into `dst`, applying via
     /// apply_synced after verification.
     fn sync_into(dst: &mut Store, src: &Store, ns: &str) -> usize {
-        let recs = src.log_records(ns, 1).unwrap();
+        let recs = src.log_records(ns, 1, 0).unwrap();
         match verify_batch([0u8; 32], &recs) {
             Ok(records) => {
                 let mut n = 0;
@@ -119,7 +119,7 @@ fn dbg_merge_verify() {
     let mut s = crate::storage::Store::open(&dir).unwrap();
     s.create_namespace("n", crate::storage::ConflictPolicy::Lww).unwrap();
     s.put("n", &b"k".to_vec(), b"v1", 100, [1u8;32], [1u8;32], 0).unwrap();
-    let recs = s.log_records("n", 1).unwrap();
+    let recs = s.log_records("n", 1, 0).unwrap();
     eprintln!("rec count {}", recs.len());
     for (seq, b) in &recs {
         eprintln!("seq {seq} len {} prev {:?}", b.len(), &b[9..13]);

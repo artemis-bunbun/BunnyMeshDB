@@ -1,6 +1,8 @@
 //! Server config (`config.toml`).
 
+use crate::core::ident::PublicKey;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -204,6 +206,27 @@ impl Config {
             .map_err(|e| format!("read config {path:?}: {e}"))?;
         let mut cfg: Config = toml::from_str(&text)
             .map_err(|e| format!("parse config {path:?}: {e}"))?;
+        // MESH-007: two configured peers carrying the same non-empty pin are the
+        // same identity under two names — refuse to start rather than risk
+        // first-match routing on duplicate pids.
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for p in &cfg.peers {
+            if p.pin.is_empty() {
+                continue;
+            }
+            match seen.get(&p.pin) {
+                Some(other) => {
+                    let pname = &p.name;
+                    let other_name = other;
+                    let pk = &p.pin;
+                    return Err(format!(
+                        "duplicate peer pin: peers {pname:?} and {other_name:?} share key {pk:?}; a peer identity must be unique"
+                    ));
+                }
+                None => {}
+            }
+            seen.insert(p.pin.clone(), p.name.clone());
+        }
         // Normalize: data_dir relative to the config file's directory.
         if let Some(parent) = path.parent() {
             if !cfg.node.data_dir.starts_with('/') {
@@ -226,8 +249,12 @@ impl Config {
         self.peers.iter().find(|p| p.name == name)
     }
 
-    /// Add a peer (name + libp2p multiaddr). Errors if the name already exists.
-    pub fn add_peer(&mut self, name: &str, addr: &str) -> Result<(), String> {
+    /// Add a peer (name + libp2p multiaddr + optional TOFU pin seed).
+    /// Errors if the name already exists, the addr is not a valid multiaddr,
+    /// the pin (when non-empty) is not a valid host public key, or another
+    /// peer already pins the same key (duplicate peer identity — MESH-007).
+    /// An empty `pin` means first-contact TOFU, exactly as before.
+    pub fn add_peer(&mut self, name: &str, addr: &str, pin: &str) -> Result<(), String> {
         if self.peer(name).is_some() {
             return Err(format!("peer {name:?} already exists"));
         }
@@ -235,7 +262,19 @@ impl Config {
             Ok(_) => {}
             Err(_) => return Err(format!("invalid peer addr {addr:?}")),
         }
-        self.peers.push(Peer { name: name.to_string(), addr: addr.to_string(), pin: "".to_string() });
+        if !pin.is_empty() {
+            if pin.parse::<PublicKey>().is_err() {
+                return Err("invalid pin: expected the peer's 64-hex-digit host public key".to_string());
+            }
+            // MESH-007: one identity key must map to at most one peer name.
+            for p in &self.peers {
+                if p.pin == pin {
+                    let pname = &p.name;
+                    return Err(format!("duplicate peer identity: pin already used by peer {pname:?}"));
+                }
+            }
+        }
+        self.peers.push(Peer { name: name.to_string(), addr: addr.to_string(), pin: pin.to_string() });
         Ok(())
     }
 
@@ -291,5 +330,55 @@ addr = "/ip4/127.0.0.1/tcp/9002"
     #[test]
     fn missing_file_errors() {
         assert!(Config::load(Path::new("/nonexistent/bmdb/config.toml")).is_err());
+    }
+
+    #[test]
+    fn add_peer_with_pin_seed_and_duplicate_identity() {
+        let mut cfg = Config::default();
+        let pk = "f484b6616f388bb0bb69953c6f351bd5aed9abd9459c469c59b763e4731a17fd";
+        // Valid add with a pin seed (MESH-003 out-of-band pinning).
+        cfg.add_peer("a", "/ip4/127.0.0.1/tcp/9100", pk).unwrap();
+        assert_eq!(cfg.peer("a").unwrap().pin, pk);
+        // Duplicate name still errors.
+        assert!(cfg.add_peer("a", "/ip4/127.0.0.1/tcp/9101", "").is_err());
+        // Invalid pin hex errors.
+        assert!(cfg.add_peer("b", "/ip4/127.0.0.1/tcp/9101", "not-hex!!").is_err());
+        // MESH-007: a second peer pinning the same key is refused.
+        match cfg.add_peer("b", "/ip4/127.0.0.1/tcp/9101", pk) {
+            Err(e) => assert!(e.contains("duplicate peer identity"), "{e}"),
+            Ok(_) => panic!("duplicate pin must be rejected"),
+        }
+        // Empty pin (TOFU) is still fine for a new peer.
+        cfg.add_peer("b", "/ip4/127.0.0.1/tcp/9101", "").unwrap();
+        assert_eq!(cfg.peer("b").unwrap().pin, "");
+    }
+
+    #[test]
+    fn load_refuses_duplicate_pins() {
+        let dir = std::env::temp_dir().join(format!("bmd-cfg-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(
+            &p,
+            r#"
+[node]
+name = "api.bunnymeshdb.test.com"
+
+[[peers]]
+name = "node2"
+addr = "/ip4/127.0.0.1/tcp/9002"
+pin = "f484b6616f388bb0bb69953c6f351bd5aed9abd9459c469c59b763e4731a17fd"
+
+[[peers]]
+name = "node3"
+addr = "/ip4/127.0.0.1/tcp/9003"
+pin = "f484b6616f388bb0bb69953c6f351bd5aed9abd9459c469c59b763e4731a17fd"
+"#,
+        )
+        .unwrap();
+        match Config::load(&p) {
+            Err(e) => assert!(e.contains("duplicate peer pin"), "{e}"),
+            Ok(_) => panic!("config with duplicate pins must refuse to load"),
+        }
     }
 }

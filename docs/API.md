@@ -59,7 +59,9 @@ Body `{ "scope", "to" }` — revoke a subject's capability for a scope.
 ### `GET|POST /l1/peers`
 Live peer management (persisted to the config file; the mesh engine dials them
 on its next kick). GET lists `{ "peers": [ { "name", "addr", "pin" } ] }`;
-POST adds `{ "name", "addr" }` (400 on invalid multiaddr or duplicate).
+POST adds `{ "name", "addr", "pin"? }` — `pin` optionally pre-seeds the TOFU
+pin (the peer's 64-hex-digit host public key); when absent the pin is bound
+on the first successful Hello (400 on invalid multiaddr or duplicate).
 
 ### `DELETE /l1/peers/{name}`
 Remove a peer. 404 `peer_not_found`.
@@ -97,12 +99,27 @@ and `"ops"` = its sub-op count; `key_b64`/`value_b64` are empty for it. The
 SSE events API (`/events?since=<seq>`) likewise emits one `change` event
 per batch record.
 
+The response is capped at **10,000 records** per poll: a client that falls
+far behind simply pages by setting `since` to the last seq it saw. There is
+no `more` flag — the array is silently truncated, so keep polling while the
+response is full.
+
+> **Retention** (FEED-RETENTION-010): the change feed replays *raw log
+> records*, so it exposes historical values — including values of keys that
+> were later overwritten or deleted — to anyone holding READ on the
+> namespace, until the log is compacted offline (`compact`). Treat the feed
+> as a full write-audit trail; a redaction option is planned.
+
 ### `GET /{tier}/{ns}/events?since=<seq>` (SSE)
 Server-Sent Events change push with resume. Replays every record after
 `since` (one `change` event per record, `id: <seq>`), then pushes live
 events for local HTTP *and* mesh-applied writes. `retry:` hints reconnect.
 Auto-resumes across dropped connections when the client passes the last seen
 seq back as `since`.
+
+Concurrent subscriptions are capped globally at **256** live streams; the
+next connect is refused with `503 too_many_streams`. A slot is released when
+the stream ends or the client disconnects.
 
 ### `GET /{tier}/{ns}/conflicts`
 `register`-policy keys holding >1 divergent version, for reconciliation:
@@ -134,7 +151,11 @@ boundary — reads inside the batch observe the **fully-applied batch** (a
 state, not a position-dependent prefix). A failing op is reported in place
 and does not abort the batch (no rollback of earlier ops).
 - `{ "op":"get", "key" }` → `{ ok:true, value_b64 }` (standard base64; a
-  missing/expired key reads as `{ ok:true, value_b64:null }`)
+  missing/expired key reads as `{ ok:true, value_b64:null }`). The
+  cumulative decoded size of `get` results is capped at **8 MiB** per batch:
+  the first `get` that would exceed it (and every `get` after it) fails with
+  `{ ok:false, error:"batch_get_response_too_large" }` instead of
+  materializing a multi-GB response
 - `{ "op":"put", "key", "value_b64", "ttl"? }` → `{ ok:true, seq }`; quota
   and JSON-Schema are enforced per op
 - `{ "op":"del", "key" }` → `{ ok:true }`

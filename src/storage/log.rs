@@ -533,7 +533,11 @@ impl Log {
         self.head
     }
 
-    /// Full record bytes for seq == self.seq (handy for sync tail).
+    /// Raw log records `[from_seq, from_seq+max)` as `(seq, full record bytes)`,
+    /// oldest first; `max == 0` reads to the end. The bound is the
+    /// materialization cap that mesh pulls and change-feed backfills rely on
+    /// (MESH-001) — a bounded read never pulls the entire remaining log into
+    /// memory for one call.
     pub fn read_records(&self, from_seq: u64, max: u64) -> Result<Vec<(u64, Vec<u8>)>, StorageError> {
         if from_seq == 0 || from_seq > self.seq {
             return Ok(Vec::new());
@@ -645,6 +649,24 @@ mod tests {
     #[test]
     fn crc32_known_answer() {
         assert_eq!(crc32(b"123456789"), 0xCBF43926, "IEEE 802.3 KAT");
+    }
+
+    #[test]
+    fn read_records_respects_max_bound() {
+        let dir = tmpdir("readbound");
+        let mut log = Log::open(&dir, "ns").unwrap();
+        for i in 0..5u64 {
+            let r = rec(TAG_PUT, format!("k{i}").as_bytes(), i, b"v");
+            log.append(&r.to_bytes(log.head())).unwrap();
+        }
+        // A finite max caps the window at from_seq..from_seq+max.
+        let recs = log.read_records(2, 2).unwrap();
+        assert_eq!(recs.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![2, 3]);
+        // max == 0 reads to the end (convenience form).
+        assert_eq!(log.read_records(1, 0).unwrap().len(), 5);
+        // A max past the end clamps to the log end; past-end from_seq is empty.
+        assert_eq!(log.read_records(3, 9).unwrap().len(), 3);
+        assert_eq!(log.read_records(99, 1).unwrap().len(), 0);
     }
 
     #[test]

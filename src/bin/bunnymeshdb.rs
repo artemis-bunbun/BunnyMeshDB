@@ -74,7 +74,14 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Clear a peer's TOFU pin (re-pins on next successful Hello).
+    /// Clear a peer's TOFU pin (re-pins on next successful Hello). The pin
+    /// is the OTHER node's root public key: after a key rollover on the
+    /// peer, this node sees a pin mismatch and refuses to sync with it
+    /// (MESH-008). Rollover procedure: restore the peer from a backup taken
+    /// before the rotation (keeps the key stable), or rotate, then `untrust`
+    /// its stale pin here so the next successful Hello re-pins the new key —
+    /// or restart the fresh peer's pin out-of-band via the config file /
+    /// `POST /l1/peers` `pin` field to skip TOFU entirely.
     Untrust {
         #[arg(long)]
         config: PathBuf,
@@ -166,7 +173,13 @@ fn main() {
                         Some(p) => {
                             p.pin.clear();
                             match cfg.save(&config) {
-                                Ok(()) => println!("cleared pin for {name}"),
+                                Ok(()) => {
+                                    println!("cleared pin for {name}");
+                                    // MESH-008: the operator just cleared a stale pin — tell
+                                    // them what happens next so a rotated key doesn't leave
+                                    // the link dead.
+                                    println!("next successful Hello re-pins the peer's current key; if the peer rotated its key, sync resumes once both sides agree (see `untrust` help for the rollover procedure).");
+                                }
                                 Err(e) => {
                                     eprintln!("error: {e}");
                                     std::process::exit(1);

@@ -2,6 +2,53 @@
 
 ## v0.4.0
 
+### Security audit — capability, HTTP, mesh, FUSE (3 parallel audits, 26 findings)
+
+First full security review of every attack surface (auth/HTTP, libp2p mesh
++ TOFU, FUSE). Fixed:
+
+- **Capability forgery via nonce reuse (CRITICAL)** — the per-request
+  capability cache was keyed by the attacker-visible `nonce`, so ANY cap
+  holder could replay their nonce into a forged admin (or any-scope) cap
+  with a garbage signature and be authorized; the signature check was
+  skipped on the cached path. The cache is now keyed by a content digest
+  (sha256 of the exact signed bytes); forged caps always re-verify the
+  signature. Regression-tested.
+- **Unauthenticated mesh Pull (CRITICAL)** — the libp2p listener served
+  `Hello`/`Pull` to ANY reachable TCP peer, letting a remote node drain the
+  entire store (all namespaces, bypassing capability auth) and forcing an
+  unbounded log materialization (OOM). Inbound requests now require a
+  configured + pinned peer (authenticated connection peer id cross-checked
+  against the pin); pulls read a bounded record window per request.
+- **GET `?prefix=` scan bypass (HIGH)** — auth was checked against the URL
+  key's directory, not the query prefix, so a cap scoped to prefix `a`
+  could scan sibling prefixes. The scan now authorizes the requested prefix
+  itself.
+- **FUSE read-back writes (HIGH)** — every file close committed the
+  open-time preload, so a read-only open could resurrect deleted data,
+  clobber concurrent writers, and grew the log on every read. Read-only
+  opens no longer buffer or write; clean closes are no-ops; expired
+  entries read as absent; truncate/append honor the handle buffer.
+- **TOFU first-contact binding (MEDIUM)** — the pin was bound from the
+  plaintext Hello `host_id`, so a MITM winning the first connection could
+  permanently displace a peer's identity. The pin must now match the
+  noise-authenticated connection peer id; peers can also be pre-seeded
+  with a pin out-of-band; persistence failures escalate.
+- **HLC same-ms collisions (MEDIUM)** — two writes in the same millisecond
+  produced identical HLCs and the second was silently dropped by sync
+  dedupe. `Hlc::now()` is a strictly-increasing process-wide issuer now.
+- **Prefix-boundary scope escape (MEDIUM)** — `Scope::covers` used raw
+  `starts_with`; cap prefix `a` covered sibling `ab`. Now segment-bounded.
+- Rate limiter: junk `Authorization` headers now share the anon bucket
+  (no unique-bucket evasion) and the bucket map has an absolute bound.
+- Batch/feed hardening: batch GET responses are byte-capped, the changes
+  feed is bounded per response, SSE catch-up is incremental (was O(n²)),
+  batch/QL validation moved outside the global store lock, quota is
+  charged only after schema validation, SSE streams are capped, `add_peer`
+  rejects duplicate identities, and a single oversized record no longer
+  wedges namespace sync.
+- CLI/daemon: `--version` (`bunnymeshdb 0.4.0` / `bunnymeshdbd 0.4.0`).
+
 ### Batched log records (ingest-side batching)
 - The batch endpoint (`/l2/{ns}/batch`, `/l3/u/{pk}/batch`) now writes
   **ONE merkle-log record per request** (`TAG_BATCH`, carrying up to 1000

@@ -32,6 +32,11 @@ Host-to-key binding:
   authenticated bootstrap (DANE-style).
 - Mesh / offline: **TOFU** on first connect; pin the key together with the
   name. Key changes surface as visible events in the merkle log.
+  Hardening (v0.4.0 audit): the TOFU pin binds only to the
+  connection-authenticated (noise) peer id — a MITM's claimed key is never
+  pinned — and inbound `Hello`/`Pull` are served ONLY to configured peers
+  whose stored pin matches the authenticated connection, so a stranger on
+  the wire cannot drain the store or drive pull loops.
 
 A name is identity-bearing: whoever resolutes the name claims the
 namespace. Capabilities keep *data* safe even under name squatting;

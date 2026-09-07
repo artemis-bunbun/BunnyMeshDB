@@ -977,9 +977,13 @@ impl Store {
         out
     }
 
-    pub fn log_records(&self, ns: &str, from_seq: u64) -> Result<Vec<(u64, Vec<u8>)>, StorageError> {
+    /// Read raw log records of `ns` starting at `from_seq`, oldest first, as
+    /// `(seq, full record bytes)` — at most `max` records (MESH-001: mesh
+    /// pulls and change-feed backfills pass a finite bound so one read never
+    /// materializes the whole remaining log; `max == 0` means "to the end").
+    pub fn log_records(&self, ns: &str, from_seq: u64, max: u64) -> Result<Vec<(u64, Vec<u8>)>, StorageError> {
         match self.logs.get(ns) {
-            Some(log) => log.read_records(from_seq, 0),
+            Some(log) => log.read_records(from_seq, max),
             None => Err(StorageError::NotFound(ns.to_string())),
         }
     }
@@ -1449,7 +1453,7 @@ impl Store {
                     self.tombs.insert((n, k), h);
                 }
                 // Re-apply the fresh records to rebuild this ns's state.
-                let recs = self.log_records(&ns, 1).unwrap_or_default();
+                let recs = self.log_records(&ns, 1, 0).unwrap_or_default();
                 for (seq, bytes) in recs {
                     match crate::storage::log::Record::parse_chain(&bytes, None) {
                         Ok((record, _)) => {
@@ -1670,7 +1674,7 @@ mod tests {
         let rows = s.scan("photos", b"");
         assert_eq!(rows.len(), 1);
         // Log keeps both records
-        assert_eq!(s.log_records("photos", 1).unwrap().len(), 3);
+        assert_eq!(s.log_records("photos", 1, 0).unwrap().len(), 3);
         assert!(s.head("photos").is_some());
         assert_eq!(s.namespaces_with_head().len(), 1);
         assert!(s.meta_get("created_ms").is_some());
@@ -1747,7 +1751,7 @@ mod tests {
         }
         // Deleted key absent, tombstone kept as a DEL record in the fresh log.
         assert_eq!(s.get("n", &b"k4".to_vec()), None);
-        let recs = s.log_records("n", 1).unwrap();
+        let recs = s.log_records("n", 1, 0).unwrap();
         assert!(recs.iter().any(|(_, bytes)| bytes[0] == TAG_DEL));
         // Seq restarted small (only live + tombstone records remain).
         assert!(recs.len() < 4);
@@ -1779,7 +1783,7 @@ mod tests {
             _ => panic!("expected Lww"),
         }
         // Seq restarted small — only live + tombstone records remain.
-        let recs = s.log_records("n", 1).unwrap();
+        let recs = s.log_records("n", 1, 0).unwrap();
         assert!(recs.len() <= 2);
         // A fresh reopen also sees the compacted state (durable).
         let s2 = Store::open(&dir).unwrap();
@@ -1918,7 +1922,7 @@ mod tests {
             _ => panic!("expected Lww"),
         }
         // Log record must parse back as TAG_PUT_TTL with the expiry intact.
-        let recs = s.log_records("n", 1).unwrap();
+        let recs = s.log_records("n", 1, 0).unwrap();
         let (seq0, seg0) = (recs[0].0, recs[0].1.clone());
         let (rec, _) = crate::storage::log::Record::parse_chain(&seg0, None).unwrap();
         assert_eq!(rec.tag, crate::storage::log::TAG_PUT_TTL);
@@ -1926,7 +1930,7 @@ mod tests {
         assert_eq!(seq0, seq);
         // Non-TTL writes stay TAG_PUT with expires 0.
         assert!(s.put("n", &b"k2".to_vec(), b"w", 101, REP, AUTH, 0).unwrap() > 0);
-        let recs2 = s.log_records("n", 2).unwrap();
+        let recs2 = s.log_records("n", 2, 0).unwrap();
         let seg1 = recs2[0].1.clone();
         let (rec2, _) = crate::storage::log::Record::parse_chain(&seg1, None).unwrap();
         assert_eq!(rec2.tag, crate::storage::log::TAG_PUT);
@@ -2071,7 +2075,7 @@ mod tests {
         }
         assert_eq!(s.get("n", &b"c".to_vec()), None, "del tombstoned");
         // The log holds ONE batch record; reprsing it applies to a fresh store.
-        let bytes = s.log_records("n", 1).unwrap().first().unwrap().1.clone();
+        let bytes = s.log_records("n", 1, 0).unwrap().first().unwrap().1.clone();
         let (rec, _) = crate::storage::log::Record::parse_chain(&bytes, None).unwrap();
         assert_eq!(rec.tag, crate::storage::log::TAG_BATCH);
         assert_eq!(rec.ops.len(), 3);

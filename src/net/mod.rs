@@ -10,6 +10,12 @@
 //! via `Store::apply_synced`, checkpoint when >1000 records applied. Any
 //! verification failure skips the namespace for this peer and retries next
 //! tick — corruption is never introduced.
+//!
+//! Trust (MESH-001): requests are only served when the requester's
+//! noise-authenticated peer id matches a stored pin (Pull), or the requester
+//! is a configured-but-unpinned peer completing the TOFU Hello handshake
+//! (Hello only — see `inbound_access`). Everything else is answered with an
+//! explicit `SyncResponse::Denied` and nothing is read or stored.
 
 pub mod merge;
 
@@ -43,6 +49,11 @@ pub enum SyncRequest {
 pub enum SyncResponse {
     Hello(HelloResponse),
     Records(Records),
+    /// MESH-001: explicit refusal — the requester is not a configured peer
+    /// whose stored pin's peer_id_of matches the connection-authenticated
+    /// peer id. Nothing was read or stored for them; the puller sees this
+    /// as a denial and backs off to the next tick.
+    Denied,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +87,15 @@ const MAX_RECORDS: usize = 1000;
 const MAX_FRAME_BYTES: usize = 960 * 1024;
 /// Records applied in one round before a checkpoint is forced.
 const CHECKPOINT_EVERY: u64 = 1000;
+/// MESH-005: at most this many pull chunks (one request-response round) per
+/// peer per tick. A peer with a deep backlog — or a hostile one — cannot
+/// monopolize a tick's event loop; the remainder defers to the next tick.
+const MAX_CHUNKS_PER_TICK: u64 = 32;
+/// MESH-006: a single record whose base64 payload alone exceeds ~8 MiB cannot
+/// fit the codec's response cap (~10 MiB) even as a solo frame. Serving it
+/// would wedge the stream; such records are refused and the namespace is
+/// skipped for this round (the puller retries next tick — never a wedge).
+const MAX_SINGLE_RECORD_B64: usize = 8 * 1024 * 1024;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct Behaviour {
@@ -236,11 +256,29 @@ enum Phase {
     Bad(String),
 }
 
+/// Per-connected-peer runtime state.
 struct PeerCtx {
     addr: Multiaddr,
     pid: Option<PeerId>,
     pin: Option<PublicKey>,
     phase: Phase,
+    /// Pull chunks processed this round (MESH-005): reset on every kick_all,
+    /// capped at MAX_CHUNKS_PER_TICK per peer.
+    round_chunks: u64,
+}
+
+/// MESH-001 access classification for an inbound request.
+#[derive(Debug, Clone, PartialEq)]
+enum InboundAccess {
+    /// Requester is not a configured peer (or is a configured peer whose
+    /// stored pin mismatches the connection): deny everything.
+    Deny,
+    /// Configured but unpinned: the TOFU Hello handshake may complete
+    /// (that is how the pin is established) but no data is served.
+    HelloOnly { name: String },
+    /// Configured peer whose stored pin's peer_id_of matches the
+    /// connection-authenticated peer id: full access (Hello + Pull).
+    Full { name: String },
 }
 
 struct Runner {
@@ -275,6 +313,8 @@ impl Runner {
             match self.peer.get_mut(&name) {
                 Some(ctx) => {
                     ctx.addr = addr;
+                    // MESH-005: a new round resets the per-peer chunk budget.
+                    ctx.round_chunks = 0;
                     if matches!(ctx.phase, Phase::AwaitingHello | Phase::Pulling { .. } | Phase::WaitingDial) {
                         continue;
                     }
@@ -284,7 +324,7 @@ impl Runner {
                 None => {
                     self.peer.insert(
                         name.clone(),
-                        PeerCtx { addr, pid: None, pin, phase: Phase::Idle },
+                        PeerCtx { addr, pid: None, pin, phase: Phase::Idle, round_chunks: 0 },
                     );
                     self.kick(name);
                 }
@@ -369,11 +409,25 @@ impl Runner {
             let ctx = self.peer.get_mut(&name).unwrap();
             match ctx.pin {
                 None => {
-                    // TOFU: first successful Hello binds the pin.
-                    let pk = peer_pk;
-                    ctx.pin = Some(pk);
-                    ctx.pid = Some(peer_id_of(&pk));
-                    self.persist_pin(&name, &pk);
+                    // MESH-003: TOFU only binds when the advertised host_id IS
+                    // the key of the connection-authenticated peer id. We must
+                    // never pin a key a Hello merely CLAIMS — an attacker who
+                    // won the dial must not be able to permanently displace the
+                    // peer's identity via a forged plaintext host_id.
+                    let advertised_pid = peer_id_of(&peer_pk);
+                    if pid != advertised_pid {
+                        tracing::warn!(
+                            peer = %name,
+                            claimed = %resp.host_id,
+                            auth_pid = %pid,
+                            "hello host_id does not match the connection-authenticated peer id; refusing to pin",
+                        );
+                        self.phase_set(&name, Phase::Bad("host_id/connection mismatch".into()));
+                        return;
+                    }
+                    ctx.pin = Some(peer_pk);
+                    ctx.pid = Some(advertised_pid);
+                    self.persist_pin(&name, &peer_pk);
                 }
                 Some(existing) if existing != peer_pk => {
                     tracing::warn!(peer = %name, expected = %existing, got = %resp.host_id, "[sync] peer pin mismatch");
@@ -408,7 +462,16 @@ impl Runner {
                 }
                 if let Some((local_seq, _)) = store.head(&nh.ns) {
                     if local_seq < nh.seq {
-                        pulls.push((nh.ns.clone(), nh.seq));
+                        // MESH-005: nh.seq is peer-supplied — never chase it
+                        // further than (MAX_RECORDS × MAX_CHUNKS_PER_TICK × 2)
+                        // ahead of our local head: a legitimately far-ahead
+                        // peer still converges, over a few ticks, while a wild
+                        // seq cannot force one unbounded pull binge.
+                        let max_target = local_seq + (MAX_RECORDS as u64) * MAX_CHUNKS_PER_TICK * 2;
+                        let target = nh.seq.min(max_target);
+                        if local_seq < target {
+                            pulls.push((nh.ns.clone(), target));
+                        }
                     }
                 }
             }
@@ -475,11 +538,15 @@ impl Runner {
             }
         };
         let mut apply_failed = false;
+        let mut applied = 0u64;
         let local_seq;
         {
             let mut store = self.engine.store.write();
             match store.apply_synced_batch(&ns, &parsed) {
-                Ok(n) => self.round_applied += n,
+                Ok(n) => {
+                    self.round_applied += n;
+                    applied = n;
+                }
                 Err(e) => {
                     tracing::warn!(peer = %name, ns = %ns, %e, "apply_synced");
                     apply_failed = true;
@@ -505,6 +572,29 @@ impl Runner {
             self.phase_set(&name, Phase::Idle);
             return;
         }
+        // MESH-005: require progress. An empty chunk — the peer is at/below
+        // our from_seq, or the window held only records we already apply —
+        // means re-pulling would loop forever over the same records. Treat it
+        // like a verify failure: skip the namespace this round; the next
+        // Hello re-evaluates from the current head.
+        if applied == 0 {
+            tracing::warn!(peer = %name, ns = %ns, local_seq, "pull applied 0 records; skipping namespace this round");
+            self.phase_set(&name, Phase::Done);
+            return;
+        }
+        // MESH-005: cap pull chunks per peer per tick — a backloggy (or
+        // belligerent) peer must not monopolize a tick; the rest defers to
+        // the next kick.
+        let chunks = {
+            let c = self.peer.get_mut(&name).unwrap();
+            c.round_chunks += 1;
+            c.round_chunks
+        };
+        if chunks >= MAX_CHUNKS_PER_TICK {
+            tracing::info!(peer = %name, ns = %ns, chunks, "hit per-tick pull cap; deferring to next tick");
+            self.phase_set(&name, Phase::Done);
+            return;
+        }
         if local_seq < target {
             self.send_pull(name.clone(), ns, target);
             return;
@@ -520,56 +610,127 @@ impl Runner {
 
     // -- inbound requests --
 
-    fn on_request(&mut self, peer: PeerId, request: SyncRequest, channel: request_response::ResponseChannel<SyncResponse>) {
-        match request {
-            SyncRequest::Hello => {
-                let (host_id, hlc, namespaces) = {
-                    let store = self.engine.store.read();
-                    let namespaces = store
-                        .namespaces_with_head()
-                        .into_iter()
-                        .map(|(ns, seq, hash)| NsHead { ns, seq, hash: hex::encode(hash) })
-                        .collect();
-                    (self.engine.kp.public().to_string(), Hlc::now().to_u64(), namespaces)
-                };
-                let resp = SyncResponse::Hello(HelloResponse { host_id, hlc, namespaces });
-                let _ = self.swarm.behaviour_mut().sync.send_response(channel, resp);
+    /// Classify an inbound request by trust level. Computed fresh from the
+    /// shared config on every call — no stale allow-list to refresh: live
+    /// add/remove/pin edits apply to the very next request.
+    ///
+    /// The check is done purely on the connection-authenticated peer id:
+    /// `peer` is the noise-verified identity of whoever sent the request.
+    /// - A stored pin deriving to that pid ⇒ `Full`.
+    /// - A pid we bound to an unpinned configured peer via our OWN outbound
+    ///   dial (the TOFU trust anchor: the key that answered at the address we
+    ///   configured) ⇒ `HelloOnly` — it may complete the handshake so the
+    ///   pin can be established, but must not pull data yet.
+    /// - A configured peer whose stored pin does NOT match the connection
+    ///   (rotated key / MITM), or no config membership at all ⇒ `Deny`.
+    fn inbound_access(&self, peer: PeerId) -> InboundAccess {
+        let cfg = self.engine.cfg.lock();
+        for p in &cfg.peers {
+            if p.pin.is_empty() {
+                continue;
             }
-            SyncRequest::Pull { ns, from_seq } => {
-                tracing::info!(%peer, ns = %ns, from_seq, "inbound pull");
-                let records = {
-                    let store = self.engine.store.read();
-                    match store.log_records(&ns, from_seq) {
-                        Ok(recs) => {
-                            let mut out = Vec::new();
-                            let mut bytes = 0usize;
-                            for (seq, payload) in recs {
-                                if payload.len() > MAX_FRAME_BYTES {
-                                    // A single record bigger than the chunk
-                                    // budget: send it ALONE rather than skip
-                                    // it — an empty chunk makes the puller
-                                    // re-pull forever from the same seq.
-                                    if out.is_empty() {
-                                        out.push(Rec { seq, payload_b64: b64_encode(&payload) });
-                                    }
-                                    break;
-                                }
-                                if out.len() >= MAX_RECORDS || bytes + payload.len() > MAX_FRAME_BYTES {
-                                    break;
-                                }
-                                bytes += payload.len();
-                                out.push(Rec { seq, payload_b64: b64_encode(&payload) });
-                            }
-                            out
-                        }
-                        Err(_) => Vec::new(),
-                    }
-                };
-                let _ = peer;
-                let resp = SyncResponse::Records(Records { ns, records });
-                let _ = self.swarm.behaviour_mut().sync.send_response(channel, resp);
+            let matches = match p.pin.parse::<PublicKey>() {
+                Ok(pk) => peer_id_of(&pk) == peer,
+                Err(_) => false, // a malformed pin never matches (fail closed)
+            };
+            if matches {
+                return InboundAccess::Full { name: p.name.clone() };
             }
         }
+        match self.name_for_pid(peer) {
+            Some(name) if cfg.peer(&name).map(|p| p.pin.is_empty()).unwrap_or(false) => {
+                InboundAccess::HelloOnly { name }
+            }
+            _ => InboundAccess::Deny,
+        }
+    }
+
+    /// MESH-001 access classification for an inbound request.
+    fn on_request(&mut self, peer: PeerId, request: SyncRequest, channel: request_response::ResponseChannel<SyncResponse>) {
+        match self.inbound_access(peer) {
+            InboundAccess::Deny => {
+                tracing::warn!(%peer, "denied inbound sync request: not a configured+pinned peer");
+                let _ = self.swarm.behaviour_mut().sync.send_response(channel, SyncResponse::Denied);
+            }
+            InboundAccess::HelloOnly { name } => match request {
+                // TOFU bootstrap: an unpinned-but-configured peer may exchange
+                // Hellos — that handshake is exactly how the pin gets bound
+                // (MESH-003 verifies host_id against the connection pid) — but
+                // it receives NO data until it is pinned (MESH-001).
+                SyncRequest::Hello => self.serve_hello(name, peer, channel),
+                SyncRequest::Pull { ns, .. } => {
+                    tracing::warn!(%peer, name = %name, ns = %ns, "denied pull from unpinned peer");
+                    let _ = self.swarm.behaviour_mut().sync.send_response(channel, SyncResponse::Denied);
+                }
+            },
+            InboundAccess::Full { name } => match request {
+                SyncRequest::Hello => self.serve_hello(name, peer, channel),
+                SyncRequest::Pull { ns, from_seq } => self.serve_pull(name, peer, channel, ns, from_seq),
+            },
+        }
+    }
+
+    fn serve_hello(&mut self, name: String, peer: PeerId, channel: request_response::ResponseChannel<SyncResponse>) {
+        tracing::info!(%peer, name = %name, "inbound hello");
+        let (host_id, hlc, namespaces) = {
+            let store = self.engine.store.read();
+            let namespaces = store
+                .namespaces_with_head()
+                .into_iter()
+                .map(|(ns, seq, hash)| NsHead { ns, seq, hash: hex::encode(hash) })
+                .collect();
+            (self.engine.kp.public().to_string(), Hlc::now().to_u64(), namespaces)
+        };
+        let resp = SyncResponse::Hello(HelloResponse { host_id, hlc, namespaces });
+        let _ = self.swarm.behaviour_mut().sync.send_response(channel, resp);
+    }
+
+    fn serve_pull(&mut self, name: String, peer: PeerId, channel: request_response::ResponseChannel<SyncResponse>, ns: String, from_seq: u64) {
+        tracing::info!(%peer, name = %name, ns = %ns, from_seq, "inbound pull");
+        let records = {
+            let store = self.engine.store.read();
+            match store.log_records(&ns, from_seq, MAX_RECORDS as u64) {
+                Ok(recs) => {
+                    let mut out = Vec::new();
+                    let mut bytes = 0usize;
+                    let mut skip = false;
+                    for (seq, payload) in recs {
+                        let b64_len = (payload.len() + 2) / 3 * 4;
+                        if b64_len > MAX_SINGLE_RECORD_B64 {
+                            // MESH-006: a single record whose base64 alone
+                            // exceeds ~8 MiB cannot fit the codec response cap
+                            // (~10 MiB) even as a solo frame — serving it would
+                            // wedge the stream permanently. Refuse the whole
+                            // chunk: the puller applies nothing and skips the
+                            // namespace this round, retrying next tick (a
+                            // warning every round, never an infinite wedge).
+                            tracing::warn!(peer = %name, ns = %ns, seq, b64_len, "record too large to serve; skipping namespace");
+                            skip = true;
+                            break;
+                        }
+                        if payload.len() > MAX_FRAME_BYTES {
+                            // A record bigger than the chunk budget but within
+                            // the codec cap: send it ALONE rather than skip it
+                            // — an empty chunk makes the puller re-pull forever
+                            // from the same seq.
+                            if out.is_empty() {
+                                out.push(Rec { seq, payload_b64: b64_encode(&payload) });
+                            }
+                            break;
+                        }
+                        if out.len() >= MAX_RECORDS || bytes + payload.len() > MAX_FRAME_BYTES {
+                            break;
+                        }
+                        bytes += payload.len();
+                        out.push(Rec { seq, payload_b64: b64_encode(&payload) });
+                    }
+                    if skip { Vec::new() } else { out }
+                }
+                Err(_) => Vec::new(),
+            }
+        };
+        let resp = SyncResponse::Records(Records { ns, records });
+        let _ = self.swarm.behaviour_mut().sync.send_response(channel, resp);
     }
 
     // -- event loop --
@@ -656,6 +817,15 @@ impl Runner {
                 request_response::Message::Response { response, .. } => match response {
                     SyncResponse::Hello(h) => self.on_hello(peer, h),
                     SyncResponse::Records(r) => self.on_records(peer, r),
+                    // MESH-001: the serving peer refused us (we are not a
+                    // pinned+configured peer on their side). Back off to Idle
+                    // and retry next tick.
+                    SyncResponse::Denied => {
+                        if let Some(name) = self.name_for_pid(peer) {
+                            tracing::warn!(peer = %name, "sync request denied by peer");
+                            self.phase_set(&name, Phase::Idle);
+                        }
+                    }
                 },
             },
             request_response::Event::OutboundFailure { peer, error, .. } => {
@@ -685,12 +855,24 @@ impl Runner {
     }
 
     fn persist_pin(&mut self, name: &str, pk: &PublicKey) {
-        let mut cfg = self.engine.cfg.lock();
-        if let Some(p) = cfg.peer_mut(name) {
-            p.pin = pk.to_string();
+        let mut failed = false;
+        {
+            let mut cfg = self.engine.cfg.lock();
+            if let Some(p) = cfg.peer_mut(name) {
+                p.pin = pk.to_string();
+            }
+            if let Err(e) = cfg.save(&self.engine.cfg_path) {
+                // MESH-003: a swallowed persist failure silently leaves the
+                // peer unpinned on disk — the next restart re-TOFUs, and a
+                // MITM who wins that reconnect displaces the identity.
+                // Escalate: error log + fail this kick so the operator sees
+                // it. The in-memory pin still guards this running session.
+                tracing::error!(%e, peer = %name, "FAILED to persist TOFU pin — in-memory pin only; sync may re-TOFU after restart");
+                failed = true;
+            }
         }
-        if let Err(e) = cfg.save(&self.engine.cfg_path) {
-            tracing::warn!(%e, "persist pin");
+        if failed {
+            self.phase_set(name, Phase::Bad("pin persist failed".into()));
         }
     }
 }

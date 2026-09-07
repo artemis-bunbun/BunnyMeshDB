@@ -139,20 +139,13 @@ pub async fn auth_mw(
     // Rate limit by capability token digest (or a shared anon bucket for
     // unauthenticated requests). On by default; 429 on breach.
     let now = now_ms();
-    let key = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(|h| {
-            let d = crate::caps::token_digest(h);
-            hex::encode(d)
-        })
-        .unwrap_or("anon".into());
-    if !state.ratelimiter.allow(&key, now) {
-        return err_json(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
-    }
     let header = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     match header {
         None => {
+            // No header: shared anonymous bucket (L3 request).
+            if !state.ratelimiter.allow("anon", now) {
+                return err_json(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+            }
             let mut req = req;
             req.extensions_mut().insert(None::<AuthCaps>);
             next.run(req).await
@@ -175,12 +168,37 @@ pub async fn auth_mw(
             };
             match cap {
                 Ok(arc) => {
+                    // Rate-limit key derivation (RATELIMIT-BYPASS-GROWTH-004):
+                    // only a header that parses into a capability for THIS node
+                    // earns a per-token bucket. Anything else — junk bytes, or
+                    // a syntactically valid cap scoped to another host —
+                    // shares the single anonymous bucket, so an attacker can
+                    // never mint an unbounded number of unique rate-limiter
+                    // map entries from arbitrary header text. Full verification
+                    // (signature, expiry, revocation) still runs per route in
+                    // the authorize path; this gate is about bucket
+                    // cardinality, not authorization.
+                    let key = if (*arc).scope.host == state.host_name {
+                        hex::encode(digest)
+                    } else {
+                        "anon".into()
+                    };
+                    if !state.ratelimiter.allow(&key, now) {
+                        return err_json(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+                    }
                     let mut req = req;
                     // Hand the shared Arc straight to the handler — no clone.
                     req.extensions_mut().insert(Some(AuthCaps(vec![arc])));
                     next.run(req).await
                 }
-                Err(_) => err_json(StatusCode::UNAUTHORIZED, "invalid_capability"),
+                Err(_) => {
+                    // Header bytes that fail to parse can never mint
+                    // per-token buckets — they share the anonymous one.
+                    if !state.ratelimiter.allow("anon", now) {
+                        return err_json(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+                    }
+                    err_json(StatusCode::UNAUTHORIZED, "invalid_capability")
+                }
             }
         }
     }
@@ -382,10 +400,16 @@ async fn l1_peers_list(
 struct AddPeerBody {
     name: String,
     addr: String,
+    /// Optional out-of-band TOFU pin seed — the peer's 64-hex-digit host
+    /// public key. When present the peer starts pinned (no first-contact
+    /// TOFU); when absent/empty the pin is bound on the first successful
+    /// Hello (see MESH-003).
+    #[serde(default)]
+    pin: String,
 }
 
 /// POST /l1/peers — add a peer (persisted to config; picked up by the mesh
-/// engine on its next kick). Body: `{ "name", "addr" }`.
+/// engine on its next kick). Body: `{ "name", "addr", "pin"? }`.
 async fn l1_peers_add(
     State(state): State<AppState>,
     Extension(caps): Extension<Option<AuthCaps>>,
@@ -396,7 +420,7 @@ async fn l1_peers_add(
         Err(r) => return r,
     }
     let mut cfg = state.config.lock();
-    match cfg.add_peer(&body.name, &body.addr) {
+    match cfg.add_peer(&body.name, &body.addr, &body.pin) {
         Ok(()) => {}
         Err(e) => return err_json(StatusCode::BAD_REQUEST, format!("{e}").as_str()),
     }
@@ -835,12 +859,14 @@ fn handle_scan(state: &AppState, caps: Option<&AuthCaps>, ns: &str, query: HashM
 ///
 /// One WRITE authorization for the whole batch (exactly like `/ql`): every
 /// op applies to `ns` and can never cross namespaces, and a read-only
-/// capability cannot use batch. All ops execute under a single store lock:
-/// reads observe the consistent prefix of the batch, writes apply
-/// sequentially. Results are returned aligned by index; a failing op is
-/// reported in place and does not abort the batch (no rollback of earlier
-/// ops). Both the rate limiter and TLS/auth are paid once per batch, not per
-/// op — that is the pipelining win.
+/// capability cannot use batch. B64 decode, schema validation and ttl sanity
+/// run WITHOUT the global store lock (attacker-schedulable cost); the write
+/// lock covers only quota charging and the atomic one-record apply, and
+/// deferred gets resolve afterwards under a read lock so they still observe
+/// the fully-applied batch. Results are returned aligned by index; a failing
+/// op is reported in place and does not abort the batch (no rollback of
+/// earlier ops). Both the rate limiter and TLS/auth are paid once per batch,
+/// not per op — that is the pipelining win.
 async fn l2_batch(
     State(state): State<AppState>,
     Extension(caps): Extension<Option<AuthCaps>>,
@@ -867,6 +893,13 @@ fn handle_batch(state: &AppState, caps: Option<&AuthCaps>, ns: &str, body: &[u8]
     /// replication frames allow ~7 MiB binary after base64+JSON envelope
     /// (codec response cap 10 MiB), so 6 MiB keeps every batch replicable.
     const MAX_BATCH_RECORD_BYTES: u64 = 6 * 1024 * 1024;
+    /// Deferred-get response cap (BATCH-GET-AMPLIFY-005): the cumulative
+    /// decoded size of values returned by batch `get` ops. The first get
+    /// that would exceed it fails in place with
+    /// `batch_get_response_too_large` and no further values are
+    /// base64-materialized — 1000 gets of large values must not yield a
+    /// multi-GB response.
+    const MAX_BATCH_GET_BYTES: u64 = 8 * 1024 * 1024;
     let parsed: JValue = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => return err_json(StatusCode::BAD_REQUEST, "bad_request"),
@@ -897,91 +930,101 @@ fn handle_batch(state: &AppState, caps: Option<&AuthCaps>, ns: &str, body: &[u8]
     // event). Reads of keys that later batch ops write therefore see the
     // final batch state, not an intermediate prefix.
     let mut accepted: Vec<crate::storage::log::Record> = Vec::with_capacity(ops.len());
-    // Result index → deferred get key / accepted write result index.
+    // Result index → deferred get key.
     let mut pending_gets: Vec<(usize, Vec<u8>)> = Vec::new();
-    let mut pending_writes: Vec<usize> = Vec::new();
+    // Accepted writes as (result index, decoded byte count), aligned 1:1 with
+    // `accepted`; quota is charged from these during apply (under the write
+    // lock), AFTER Pass 1 has schema-validated the value
+    // (QUOTA-BEFORE-VALIDATE-008).
+    let mut pending_writes: Vec<(usize, u64)> = Vec::new();
     let mut mutated = false;
-    {
-        let mut store = state.store.write();
-        if tier == Tier::L3 {
-            if let Err(e) = ensure_l3_namespace(&mut store, &principal) {
-                return auth_to_response(e);
+
+    // ---- Pass 0: serialized-record size preflight (b64 lengths, no
+    // decode — a decoded size never exceeds this bound) ----
+    // The whole batch becomes ONE log record, so bound it before any quota
+    // is charged or bytes appended: a record that could not pass through the
+    // mesh replication frame budget would wedge that namespace's sync, so
+    // refuse it up front instead. No store access — runs without any lock.
+    let mut est = 0u64;
+    for op in ops {
+        let op_name = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
+        let key_len = match op.get("key").and_then(|k| k.as_str()) {
+            Some(k) => k.len() as u64,
+            None => 0,
+        };
+        match op_name {
+            "put" => {
+                // sub-tag(1) + key_len(4) + key + hlc(8) + replica(32) +
+                // author(32) + val_len(8) + value + ttl(8).
+                let val_bound = match op.get("value_b64").and_then(|v| v.as_str()) {
+                    Some(s) => ((s.len() as u64 + 3) / 4) * 3,
+                    None => 0,
+                };
+                est += 93 + key_len + val_bound;
             }
-        } else if store.policy(ns).is_none() {
-            return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
-        }
-        // ---- Pass 0: serialized-record size preflight (b64 lengths, no
-        // decode — a decoded size never exceeds this bound) ----
-        // The whole batch becomes ONE log record, so bound it before any
-        // quota is charged or bytes appended: a record that could not pass
-        // through the mesh replication frame budget would wedge that
-        // namespace's sync, so refuse it up front instead.
-        let mut est = 0u64;
-        for op in ops {
-            let op_name = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
-            let key_len = match op.get("key").and_then(|k| k.as_str()) {
-                Some(k) => k.len() as u64,
-                None => 0,
-            };
-            match op_name {
-                "put" => {
-                    // sub-tag(1) + key_len(4) + key + hlc(8) + replica(32) +
-                    // author(32) + val_len(8) + value + ttl(8).
-                    let val_bound = match op.get("value_b64").and_then(|v| v.as_str()) {
-                        Some(s) => ((s.len() as u64 + 3) / 4) * 3,
-                        None => 0,
-                    };
-                    est += 93 + key_len + val_bound;
-                }
-                "del" => {
-                    est += 85 + key_len;
-                }
-                _ => {}
+            "del" => {
+                est += 85 + key_len;
             }
+            _ => {}
         }
-        if est > MAX_BATCH_RECORD_BYTES {
-            return err_json(StatusCode::PAYLOAD_TOO_LARGE, "batch_too_large");
-        }
-        // ---- Pass 1: validate every op, collecting accepted writes ----
-        for op in ops {
-            let op_name = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
-            let key = match op.get("key").and_then(|k| k.as_str()) {
-                Some(k) => k.as_bytes().to_vec(),
-                None => {
-                    results.push(Some(json!({ "ok": false, "error": "missing_key" })));
-                    continue;
-                }
-            };
-            match op_name {
-                "get" => {
-                    pending_gets.push((results.len(), key));
-                    results.push(None);
-                }
-                "put" => {
-                    let value = match op.get("value_b64").and_then(|v| v.as_str()) {
-                        Some(v) => match b64_decode(v) {
-                            Ok(b) => b,
-                            Err(_) => {
-                                results.push(Some(json!({ "ok": false, "error": "bad_value_b64" })));
-                                continue;
-                            }
-                        },
-                        None => {
-                            results.push(Some(json!({ "ok": false, "error": "missing_value_b64" })));
+    }
+    if est > MAX_BATCH_RECORD_BYTES {
+        return err_json(StatusCode::PAYLOAD_TOO_LARGE, "batch_too_large");
+    }
+    // Snapshot the namespace schema ONCE (transient read guard, released
+    // immediately). Pass 1 validates every value against this snapshot with
+    // NO store lock held (LOCK-ACROSS-BATCH-007): b64 decode, schema
+    // validation and ttl sanity are the attacker-schedulable costs, so they
+    // never run under the global write lock. If an admin changes the schema
+    // between this snapshot and the apply below, enforcement for this batch
+    // reflects the snapshot — an accepted, documented micro-window
+    // (enforcement is a policy knob, not an authorization boundary).
+    let schema: Option<JValue> = {
+        let store = state.store.read();
+        store.schema(ns).map(|bytes| {
+            let src = String::from_utf8_lossy(bytes).into_owned();
+            serde_json::from_str::<JValue>(&src).unwrap_or(JValue::Null)
+        })
+    };
+    // ---- Pass 1: validate every op, collecting accepted writes (no lock) ----
+    for op in ops {
+        let op_name = op.get("op").and_then(|o| o.as_str()).unwrap_or("");
+        let key = match op.get("key").and_then(|k| k.as_str()) {
+            Some(k) => k.as_bytes().to_vec(),
+            None => {
+                results.push(Some(json!({ "ok": false, "error": "missing_key" })));
+                continue;
+            }
+        };
+        match op_name {
+            "get" => {
+                pending_gets.push((results.len(), key));
+                results.push(None);
+            }
+            "put" => {
+                let value = match op.get("value_b64").and_then(|v| v.as_str()) {
+                    Some(v) => match b64_decode(v) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            results.push(Some(json!({ "ok": false, "error": "bad_value_b64" })));
                             continue;
                         }
-                    };
-                    if let Err(e) = account_write(&mut store, ns, value.len() as u64, state.default_quota) {
-                        results.push(Some(json!({ "ok": false, "error": format!("{e}") })));
+                    },
+                    None => {
+                        results.push(Some(json!({ "ok": false, "error": "missing_value_b64" })));
                         continue;
                     }
-                    if let Some(schema_bytes) = store.schema(ns) {
-                        let src = String::from_utf8_lossy(schema_bytes).into_owned();
-                        let schema = serde_json::from_str::<JValue>(&src).unwrap_or(JValue::Null);
+                };
+                // Schema validation happens HERE (before any quota charge,
+                // which only occurs in the apply phase below) and against the
+                // snapshot taken above, without the store lock
+                // (QUOTA-BEFORE-VALIDATE-008, LOCK-ACROSS-BATCH-007).
+                match &schema {
+                    Some(schema) => {
                         let payload = String::from_utf8_lossy(&value).into_owned();
                         match serde_json::from_str::<JValue>(&payload) {
                             Ok(v) => {
-                                if let Err(msg) = validate_schema(&schema, &v) {
+                                if let Err(msg) = validate_schema(schema, &v) {
                                     results.push(Some(json!({ "ok": false, "error": format!("schema_violation: {msg}") })));
                                     continue;
                                 }
@@ -992,67 +1035,126 @@ fn handle_batch(state: &AppState, caps: Option<&AuthCaps>, ns: &str, body: &[u8]
                             }
                         }
                     }
-                    let expires_at = match op.get("ttl").and_then(|s| s.as_u64()) {
-                        Some(secs) if secs > 0 => now_ms() + secs * 1000,
-                        _ => 0,
-                    };
-                    let hlc = Hlc::now().to_u64();
-                    accepted.push(crate::storage::log::Record {
-                        tag: if expires_at == 0 { crate::storage::log::TAG_PUT } else { crate::storage::log::TAG_PUT_TTL },
-                        key,
-                        hlc,
-                        replica: rid,
-                        author: pid,
-                        value,
-                        expires_at,
-                        ops: Vec::new(),
-                    });
-                    pending_writes.push(results.len());
-                    results.push(None);
+                    None => {}
                 }
-                "del" => {
-                    let hlc = Hlc::now().to_u64();
-                    accepted.push(crate::storage::log::Record {
-                        tag: crate::storage::log::TAG_DEL,
-                        key,
-                        hlc,
-                        replica: rid,
-                        author: pid,
-                        value: Vec::new(),
-                        expires_at: 0,
-                        ops: Vec::new(),
-                    });
-                    pending_writes.push(results.len());
-                    results.push(None);
+                let expires_at = match op.get("ttl").and_then(|s| s.as_u64()) {
+                    Some(secs) if secs > 0 => now_ms() + secs * 1000,
+                    _ => 0,
+                };
+                let vlen = value.len() as u64;
+                let hlc = Hlc::now().to_u64();
+                accepted.push(crate::storage::log::Record {
+                    tag: if expires_at == 0 { crate::storage::log::TAG_PUT } else { crate::storage::log::TAG_PUT_TTL },
+                    key,
+                    hlc,
+                    replica: rid,
+                    author: pid,
+                    value,
+                    expires_at,
+                    ops: Vec::new(),
+                });
+                pending_writes.push((results.len(), vlen));
+                results.push(None);
+            }
+            "del" => {
+                let hlc = Hlc::now().to_u64();
+                accepted.push(crate::storage::log::Record {
+                    tag: crate::storage::log::TAG_DEL,
+                    key,
+                    hlc,
+                    replica: rid,
+                    author: pid,
+                    value: Vec::new(),
+                    expires_at: 0,
+                    ops: Vec::new(),
+                });
+                pending_writes.push((results.len(), 0u64));
+                results.push(None);
+            }
+            _ => results.push(Some(json!({ "ok": false, "error": "unknown_op" }))),
+        }
+    }
+    // ---- Apply + quota charge (write lock; minimal scope) ----
+    // The lock covers ONLY: namespace existence/provisioning, per-op quota
+    // charging, and the atomic one-record apply (LOCK-ACROSS-BATCH-007).
+    let mut batch_seq = 0u64;
+    {
+        let mut store = state.store.write();
+        if tier == Tier::L3 {
+            if let Err(e) = ensure_l3_namespace(&mut store, &principal) {
+                return auth_to_response(e);
+            }
+        } else if store.policy(ns).is_none() {
+            return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
+        }
+        // Charge quota first, then apply the surviving ops as ONE atomic
+        // record. A quota failure drops the op from the applied batch and is
+        // reported in place without charging it; the charge only ever happens
+        // for ops that already passed schema validation in Pass 1.
+        let mut applied: Vec<crate::storage::log::Record> = Vec::with_capacity(accepted.len());
+        for (i, rec) in accepted.into_iter().enumerate() {
+            let (result_idx, bytes) = pending_writes[i];
+            match account_write(&mut store, ns, bytes, state.default_quota) {
+                Ok(()) => {
+                    applied.push(rec);
                 }
-                _ => results.push(Some(json!({ "ok": false, "error": "unknown_op" }))),
+                Err(e) => {
+                    results[result_idx] = Some(json!({ "ok": false, "error": format!("{e}") }));
+                }
             }
         }
-        // ---- Apply: ONE record for the whole batch ----
-        let mut batch_seq = 0u64;
-        if !accepted.is_empty() {
-            match store.put_batch(ns, &accepted) {
+        if !applied.is_empty() {
+            match store.put_batch(ns, &applied) {
                 Ok(seq) => {
                     batch_seq = seq;
-                    for _ in &pending_writes {
+                    for _ in &applied {
                         state.metrics.bump_writes();
                     }
                     mutated = true;
                 }
                 Err(e) => {
-                    // Append failed: report every accepted write in place.
-                    for i in &pending_writes {
-                        results[*i] = Some(json!({ "ok": false, "error": format!("{e}") }));
+                    // Append failed: report every charged-but-unapplied write
+                    // in place. Bytes already charged stay on the ledger (it
+                    // is monotonic, like the log); this only happens on
+                    // storage failure, never on attacker input.
+                    for (i, _) in &pending_writes {
+                        if results[*i].is_none() {
+                            results[*i] = Some(json!({ "ok": false, "error": format!("{e}") }));
+                        }
                     }
                 }
             }
         }
-        // ---- Resolve deferred gets against the fully-applied batch ----
-        let now = now_ms();
+    }
+    // ---- Resolve deferred gets against the fully-applied batch ----
+    // Read lock, taken AFTER the write lock is released: gets must observe
+    // the batch's final state, and a read guard keeps the global lock
+    // minimal (LOCK-ACROSS-BATCH-007). Cumulative decoded get bytes are
+    // capped (BATCH-GET-AMPLIFY-005): the first get that would exceed the
+    // cap fails in place — and every remaining one after it — instead of
+    // materializing a multi-GB response.
+    let now = now_ms();
+    let mut gets_budget = MAX_BATCH_GET_BYTES;
+    let mut over_cap = false;
+    {
+        let store = state.store.read();
         for (i, key) in pending_gets {
+            if over_cap {
+                results[i] = Some(json!({ "ok": false, "error": "batch_get_response_too_large" }));
+                continue;
+            }
             match store.get(ns, &key) {
                 Some(e) => match latest_value(e, now) {
-                    Some(v) => results[i] = Some(json!({ "ok": true, "value_b64": b64_encode(&v) })),
+                    Some(v) if (v.len() as u64) <= gets_budget => {
+                        gets_budget -= v.len() as u64;
+                        results[i] = Some(json!({ "ok": true, "value_b64": b64_encode(&v) }));
+                    }
+                    Some(_) => {
+                        // Over the cumulative cap: fail this get and do not
+                        // touch the store or materialize further values.
+                        results[i] = Some(json!({ "ok": false, "error": "batch_get_response_too_large" }));
+                        over_cap = true;
+                    }
                     // Expired reads as absence (GET returns 404 for both
                     // missing and expired).
                     None => results[i] = Some(json!({ "ok": true, "value_b64": null })),
@@ -1060,9 +1162,11 @@ fn handle_batch(state: &AppState, caps: Option<&AuthCaps>, ns: &str, body: &[u8]
                 None => results[i] = Some(json!({ "ok": true, "value_b64": null })),
             }
         }
-        // ---- Resolve accepted writes (all share the batch record's seq) ----
-        for i in &pending_writes {
-            results[*i] = Some(json!({ "ok": true, "seq": batch_seq }));
+    }
+    // ---- Resolve applied writes (all share the batch record's seq) ----
+    for (i, _) in pending_writes {
+        if results[i].is_none() {
+            results[i] = Some(json!({ "ok": true, "seq": batch_seq }));
         }
     }
     if mutated {
@@ -1164,12 +1268,10 @@ fn handle_data(
             } else if store.policy(ns).is_none() {
                 return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
             }
-            if let Err(e) = account_write(&mut store, ns, body.len() as u64, state.default_quota) {
-                return auth_to_response(e);
-            }
-            let hlc = Hlc::now().to_u64();
-            let rid = state.root.to_bytes();
-            // Enforce the namespace JSON-Schema (if set) before commit.
+            // Enforce the namespace JSON-Schema (if set) BEFORE charging
+            // quota (QUOTA-BEFORE-VALIDATE-008): a schema-violating write
+            // must not consume the caller's quota. Validation runs under the
+            // write lock so a concurrent schema change cannot race the check.
             if let Some(schema_bytes) = store.schema(ns) {
                 let src = String::from_utf8_lossy(schema_bytes).into_owned();
                 let schema = serde_json::from_str::<JValue>(&src).unwrap_or(JValue::Null);
@@ -1182,12 +1284,22 @@ fn handle_data(
                     Err(_) => return err_json(StatusCode::BAD_REQUEST, "schema_violation: value is not valid JSON"),
                 }
             }
+            if let Err(e) = account_write(&mut store, ns, body.len() as u64, state.default_quota) {
+                return auth_to_response(e);
+            }
+            let hlc = Hlc::now().to_u64();
+            let rid = state.root.to_bytes();
             // `?ttl=<secs>` sets a wall-clock expiry (0/absent = never).
             // Overflow on absurd values merely wraps → value reads already-expired.
             let expires_at = match query.get("ttl").and_then(|s| s.parse::<u64>().ok()) {
                 Some(secs) if secs > 0 => now_ms() + secs * 1000,
                 _ => 0,
             };
+            // Schema was validated and quota charged above; a storage failure
+            // after charging leaves the delta counted (the quota ledger is
+            // monotonic by design, like the log). This only happens on real
+            // I/O errors, never on attacker input — charge-then-fail window
+            // is accepted, not refunded (QUOTA-BEFORE-VALIDATE-008).
             match store.put(ns, &k, body, hlc, rid, principal.to_bytes(), expires_at) {
                 Ok(seq) => {
                     drop(store);
@@ -1242,6 +1354,14 @@ fn run_ql(state: &AppState, caps: Option<&AuthCaps>, ns: &str, expr: &str) -> Re
         Ok(_) => {}
         Err(r) => return r,
     }
+    // LOCK-ACROSS-BATCH-007: eval runs under the write lock. The language is
+    // not read-only over HTTP — `put`, `del`, `index_create`, `index_drop`
+    // all mutate and are NOT gated (only `use`/`create_ns` are refused for
+    // remote callers), and `QueryCtx.store` is typed `&mut Store`, so a
+    // read-lock fast path is impossible without a query-module rework. The
+    // lock is therefore kept (atomic single-statement semantics, same as a
+    // batch apply); the attacker-schedulable cost here is bounded by the
+    // parser/statement count, not by the lock itself.
     let mut store = state.store.write();
     let mut ctx = QueryCtx { store: &mut store, scope: Some(ns.to_string()), host_id: state.root, remote: true };
     match eval(&mut ctx, expr) {
@@ -1276,6 +1396,13 @@ async fn ql_l3(
 
 // ---------- change feed ----------
 
+/// Cap on the records `/changes` emits per response (FEED-REPLAY-006): a
+/// client asking `since=0` must not be handed the entire history — raw
+/// values can be large. The response shape is unchanged: the array is
+/// silently truncated at MAX_CHANGES and the client keeps polling with
+/// `since` set to the last seen seq.
+const MAX_CHANGES: usize = 10_000;
+
 /// GET /l2/{ns}/head — namespace log head (seq + chain hash). Poll or change
 /// events against this to detect new writes without pulling the whole feed.
 async fn l2_head(
@@ -1297,6 +1424,8 @@ async fn l2_head(
 /// GET /l2/{ns}/changes?since=<seq> — log records after `since`, oldest
 /// first. Each change is one durable record (PUT / DEL / TTL). Polling with
 /// `since` = the previous response's `head.seq` yields a gapless stream.
+/// The response is capped at MAX_CHANGES records (FEED-REPLAY-006): clients
+/// that fall far behind simply page with `since`.
 async fn l2_changes(
     State(state): State<AppState>,
     Extension(caps): Extension<Option<AuthCaps>>,
@@ -1313,30 +1442,31 @@ async fn l2_changes(
         return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
     }
     let head = store.head(&ns).map(|(seq, h)| json!({ "seq": seq, "hash": hex::encode(&h) })).unwrap_or(JValue::Null);
-    let changes: Vec<JValue> = match store.log_records(&ns, since + 1) {
-        Ok(recs) => recs
-            .into_iter()
-            .map(|(seq, bytes)| {
-                match crate::storage::log::Record::parse_chain(&bytes, None) {
-                    Ok((rec, _)) => json!({
-                        "seq": seq,
-                        "key_b64": b64_encode(&rec.key),
-                        "value_b64": b64_encode(&rec.value),
-                        "del": rec.tag == crate::storage::log::TAG_DEL,
-                        "ttl": rec.expires_at != 0,
-                        "expires_at": rec.expires_at,
-                        "hlc": rec.hlc,
-                        // A batch record is one atomic write of N ops; the
-                        // feed shows it as one change with its op count.
-                        "batch": rec.tag == crate::storage::log::TAG_BATCH,
-                        "ops": rec.ops.len() as u64,
-                    }),
-                    Err(_) => json!({ "seq": seq, "parse_error": true }),
-                }
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    // Bounded emission: the log read is capped at MAX_CHANGES records and
+    // the loop stops there too, so a `since=0` poll can never materialize
+    // the whole history (FEED-REPLAY-006).
+    let mut changes: Vec<JValue> = Vec::new();
+    for (seq, bytes) in store.log_records(&ns, since + 1, MAX_CHANGES as u64).unwrap_or_default() {
+        if changes.len() >= MAX_CHANGES {
+            break;
+        }
+        match crate::storage::log::Record::parse_chain(&bytes, None) {
+            Ok((rec, _)) => changes.push(json!({
+                "seq": seq,
+                "key_b64": b64_encode(&rec.key),
+                "value_b64": b64_encode(&rec.value),
+                "del": rec.tag == crate::storage::log::TAG_DEL,
+                "ttl": rec.expires_at != 0,
+                "expires_at": rec.expires_at,
+                "hlc": rec.hlc,
+                // A batch record is one atomic write of N ops; the
+                // feed shows it as one change with its op count.
+                "batch": rec.tag == crate::storage::log::TAG_BATCH,
+                "ops": rec.ops.len() as u64,
+            })),
+            Err(_) => changes.push(json!({ "seq": seq, "parse_error": true })),
+        }
+    }
     Json(json!({ "since": since, "head": head, "changes": changes })).into_response()
 }
 
@@ -1375,30 +1505,31 @@ async fn l3_changes(
         return err_json(StatusCode::NOT_FOUND, "namespace_not_found");
     }
     let head = store.head(&ns).map(|(seq, h)| json!({ "seq": seq, "hash": hex::encode(&h) })).unwrap_or(JValue::Null);
-    let changes: Vec<JValue> = match store.log_records(&ns, since + 1) {
-        Ok(recs) => recs
-            .into_iter()
-            .map(|(seq, bytes)| {
-                match crate::storage::log::Record::parse_chain(&bytes, None) {
-                    Ok((rec, _)) => json!({
-                        "seq": seq,
-                        "key_b64": b64_encode(&rec.key),
-                        "value_b64": b64_encode(&rec.value),
-                        "del": rec.tag == crate::storage::log::TAG_DEL,
-                        "ttl": rec.expires_at != 0,
-                        "expires_at": rec.expires_at,
-                        "hlc": rec.hlc,
-                        // A batch record is one atomic write of N ops; the
-                        // feed shows it as one change with its op count.
-                        "batch": rec.tag == crate::storage::log::TAG_BATCH,
-                        "ops": rec.ops.len() as u64,
-                    }),
-                    Err(_) => json!({ "seq": seq, "parse_error": true }),
-                }
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    // Bounded emission: the log read is capped at MAX_CHANGES records and
+    // the loop stops there too, so a `since=0` poll can never materialize
+    // the whole history (FEED-REPLAY-006).
+    let mut changes: Vec<JValue> = Vec::new();
+    for (seq, bytes) in store.log_records(&ns, since + 1, MAX_CHANGES as u64).unwrap_or_default() {
+        if changes.len() >= MAX_CHANGES {
+            break;
+        }
+        match crate::storage::log::Record::parse_chain(&bytes, None) {
+            Ok((rec, _)) => changes.push(json!({
+                "seq": seq,
+                "key_b64": b64_encode(&rec.key),
+                "value_b64": b64_encode(&rec.value),
+                "del": rec.tag == crate::storage::log::TAG_DEL,
+                "ttl": rec.expires_at != 0,
+                "expires_at": rec.expires_at,
+                "hlc": rec.hlc,
+                // A batch record is one atomic write of N ops; the
+                // feed shows it as one change with its op count.
+                "batch": rec.tag == crate::storage::log::TAG_BATCH,
+                "ops": rec.ops.len() as u64,
+            })),
+            Err(_) => changes.push(json!({ "seq": seq, "parse_error": true })),
+        }
+    }
     Json(json!({ "since": since, "head": head, "changes": changes })).into_response()
 }
 
@@ -1492,6 +1623,50 @@ async fn l3_events(
     sse_events(state, ns, since)
 }
 
+/// Global concurrent `/events` subscription cap (SSE-UNBOUNDED-CONN-009):
+/// each live SSE stream reserves one slot; the (cap+1)th connect is refused
+/// with 503 so an unbounded number of open connections cannot pile up.
+const MAX_SSE_CONNS: u64 = 256;
+
+/// Live SSE stream reservation counter (process-wide, shared by all
+/// namespaces). Module-level static, like `core/hlc.rs::LAST`.
+static SSE_CONNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// RAII guard for one SSE slot. Bound inside the unfold stream's state, the
+/// reservation lives exactly as long as the stream: when the stream ends
+/// (channel closed) or is dropped (client disconnect), the captured guard is
+/// dropped and the counter decrements — no explicit teardown hook needed.
+struct SseSlot {
+    decremented: bool,
+}
+
+impl Drop for SseSlot {
+    fn drop(&mut self) {
+        if !self.decremented {
+            self.decremented = true;
+            let _ = SSE_CONNS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Reserve one SSE slot under the global cap; None when full.
+fn acquire_sse_slot() -> Option<SseSlot> {
+    loop {
+        let cur = SSE_CONNS.load(std::sync::atomic::Ordering::Relaxed);
+        if cur >= MAX_SSE_CONNS {
+            return None;
+        }
+        let expected = cur;
+        if SSE_CONNS
+            .compare_exchange_weak(expected, cur + 1, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst)
+            .is_ok()
+        {
+            return Some(SseSlot { decremented: false });
+        }
+        // Lost the race; re-read and retry.
+    }
+}
+
 /// The event stream with resume. On connect, replays every record after
 /// `since` from the durable log as one `change` event per record (each with
 /// `id: <seq>` — gapless, so a reconnecting client passes `since` = last seen
@@ -1500,14 +1675,22 @@ async fn l3_events(
 /// stream to drain whatever new records exist. Stays connected until the
 /// broadcast channel closes (daemon shutdown).
 fn sse_events(state: AppState, ns: String, since: u64) -> Response {
+    // Reserve an SSE slot up front; 503 when the global cap is reached. The
+    // guard rides the stream state below and is dropped with it.
+    let Some(slot) = acquire_sse_slot() else {
+        return err_json(StatusCode::SERVICE_UNAVAILABLE, "too_many_streams");
+    };
     let rx = state.change_tx.subscribe();
     let store = state.store.clone();
-    let stream = futures::stream::unfold((rx, store, ns.clone(), since), |(mut rx, store, ns, cursor)| async move {
+    let stream = futures::stream::unfold((rx, store, ns.clone(), since, slot), |(mut rx, store, ns, cursor, slot)| async move {
         let cur = cursor;
         loop {
-            // Drain at most one record from the durable log (cursor+1); copy
-            // it out so refs don't dangle after the log snapshot drops.
-            let recs = store.read().log_records(&ns, cur + 1).unwrap_or_default();
+            // Drain AT MOST ONE record from the durable log (cursor+1): the
+            // bounded read (max=1) fetches just the next record instead of
+            // re-materializing the whole tail on every step — the O(n^2)
+            // catch-up fix (FEED-REPLAY-006). Copy it out so refs don't
+            // dangle after the log snapshot drops.
+            let recs = store.read().log_records(&ns, cur + 1, 1).unwrap_or_default();
             let first_seq = recs.first().map(|(s, _)| *s);
             let first_bytes = recs.first().map(|(_, b)| b.to_vec());
             if let Some(seq) = first_seq {
@@ -1523,7 +1706,7 @@ fn sse_events(state: AppState, ns: String, since: u64) -> Response {
                     .event("change")
                     .json_data(payload)
                     .unwrap_or_default();
-                return Some((Ok::<_, std::convert::Infallible>(ev), (rx, store, ns, seq)));
+                return Some((Ok::<_, std::convert::Infallible>(ev), (rx, store, ns, seq, slot)));
             }
             // Caught up: wait for the next write to this namespace.
             match rx.recv().await {
