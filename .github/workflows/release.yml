@@ -22,11 +22,16 @@ jobs:
       - name: SDK typecheck
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
       - run: cd sdk && npm install && npx tsc -p tsconfig.json
 
   build:
     needs: test
+    # softprops/action-gh-release creates the GitHub release for the tag; the
+    # default GITHUB_TOKEN is read-only, which 403s ("Resource not accessible
+    # by integration") without an explicit write grant here.
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
