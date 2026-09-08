@@ -55,3 +55,34 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: target/${{ matrix.target }}/release/bunnymeshdb-${{ matrix.target }}.tgz
+
+  # Publishes the ~15 MB Alpine/musl image (bunnymeshdb + bunnymeshdbd + fuse3)
+  # to GHCR for the tag: ghcr.io/artemis-bunbun/bunnymeshdb:<tag> + :latest.
+  # GITHUB_TOKEN can push packages with an explicit `packages: write` grant.
+  docker:
+    needs: [test, build]
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/artemis-bunbun/bunnymeshdb:${{ github.ref_name }}
+            ghcr.io/artemis-bunbun/bunnymeshdb:latest
