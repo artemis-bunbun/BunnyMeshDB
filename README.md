@@ -1,3 +1,12 @@
+<p align="center">
+  <a href="https://bunnymesh.com">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/bunnymesh-logo-lightblue.png">
+      <img alt="BunnyMeshDB" src="assets/bunnymesh-logo-dark.png" width="240">
+    </picture>
+  </a>
+</p>
+
 # BunnyMeshDB
 
 A decentralized, multi-master database with libp2p mesh sync, capability-based
